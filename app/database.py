@@ -1,27 +1,26 @@
 import sqlite3
+import os
 from datetime import datetime
 
 DB_PATH = "data/jarvis.db"
 
 def init_db():
     """Создает базу данных и таблицы, если их еще нет"""
-    import os
-    # Создаем папку data, если ее нет
     os.makedirs("data", exist_ok=True)
-    
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Таблица для товаров
+    # Таблица для товаров (добавили price)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS products (
         sku TEXT PRIMARY KEY,
         name TEXT,
+        price REAL,
         updated_at TEXT
     )
     """)
     
-    # Таблица для журнала синхронизации (наша "честность" данных)
+    # Таблица для журнала синхронизации
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS sync_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,36 +32,29 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    print("База данных готова к работе!")
 
-def save_test_products():
-    """Сохраняет 3 фейковых товара для теста"""
+def save_products(items: list):
+    """Сохраняет список товаров, полученных от Ozon"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     now = datetime.now().isoformat()
     
-    # Фейковые данные
-    test_items = [
-        ("111111", "Тестовый товар 1 (Пистолет ТТ)", now),
-        ("222222", "Тестовый товар 2 (пара сапог)", now),
-        ("333333", "Тестовый товар 3 (2 рубля за пазухой)", now)
-    ]
-    
-    cursor.executemany(
-        "INSERT OR REPLACE INTO products (sku, name, updated_at) VALUES (?, ?, ?)",
-        test_items
-    )
+    # Перебираем товары и сохраняем их
+    for item in items:
+        cursor.execute(
+            "INSERT OR REPLACE INTO products (sku, name, price, updated_at) VALUES (?, ?, ?, ?)",
+            (item["sku"], item["name"], item["price"], now)
+        )
     
     # Записываем в журнал
     cursor.execute(
         "INSERT INTO sync_log (source, status, message, started_at) VALUES (?, ?, ?, ?)",
-        ("TEST_DATA", "success", "Загружены тестовые данные", now)
+        ("OZON_API", "success", f"Загружено товаров: {len(items)}", now)
     )
     
     conn.commit()
     conn.close()
-    print("3 тестовых товара сохранены в базу!")
+    print(f"Успешно сохранено товаров в базу: {len(items)}")
 
 def show_products():
     """Показывает товары из базы"""
@@ -74,5 +66,5 @@ def show_products():
     
     print("\n--- ТОВАРЫ В БАЗЕ ---")
     for row in rows:
-        print(f"SKU: {row[0]} | Название: {row[1]} | Обновлено: {row[2]}")
+        print(f"SKU: {row[0]} | Название: {row[1]} | Цена: {row[2]} руб. | Обновлено: {row[3]}")
     print("---------------------\n")

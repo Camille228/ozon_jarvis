@@ -2,13 +2,16 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
-from app.database import init_db, save_products
+from app.database import init_db, save_products, update_cost
 from app.ozon_client import get_products
 
 # Настраиваем внешний вид страницы
 st.set_page_config(page_title="OZON JARVIS", page_icon="📦", layout="wide")
 
 st.title("📦 OZON JARVIS — Система управления")
+
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ (в т.ч. миграция колонки cost_price) ---
+init_db()
 
 # --- БЛОК СВЕТОФОРА СВЕЖЕСТИ ---
 conn = sqlite3.connect("data/jarvis.db")
@@ -59,7 +62,36 @@ st.divider()
 try:
     st.subheader("Товары в базе")
     df_products = pd.read_sql_query("SELECT * FROM products", conn)
+    df_products["Прибыль (Предварительная)"] = (
+        df_products["price"].fillna(0) - df_products["cost_price"].fillna(0)
+    )
+    df_products = df_products[
+        ["sku", "name", "price", "cost_price", "Прибыль (Предварительная)", "updated_at"]
+    ]
     st.dataframe(df_products, width='stretch')
+
+    st.subheader("Себестоимость товаров")
+    if not df_products.empty:
+        sku_options = df_products["sku"].tolist()
+        sku_names = dict(zip(df_products["sku"], df_products["name"]))
+        with st.form("cost_form"):
+            selected_sku = st.selectbox(
+                "SKU товара",
+                sku_options,
+                format_func=lambda s: f"{s} — {sku_names.get(s, 'Без названия')}",
+            )
+            cost = st.number_input(
+                "Себестоимость, руб.", min_value=0.0, step=0.01, format="%.2f"
+            )
+            submitted = st.form_submit_button("💾 Сохранить себестоимость")
+            if submitted:
+                update_cost(selected_sku, cost)
+                st.success(
+                    f"Себестоимость для SKU {selected_sku} сохранена: {cost:.2f} руб."
+                )
+                st.rerun()
+    else:
+        st.info("Добавьте товары, чтобы ввести себестоимость.")
 
     st.subheader("Журнал синхронизации (статусы данных)")
     df_log = pd.read_sql_query("SELECT * FROM sync_log ORDER BY id DESC", conn)

@@ -134,6 +134,24 @@ def init_db():
     )
     """)
 
+    # Справочник складов: мои склады (FBS) и склады Ozon (FBO)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS warehouses (
+        warehouse_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        name TEXT,
+        address TEXT,
+        warehouse_type TEXT,
+        status TEXT,
+        is_rfbs INTEGER DEFAULT 0,
+        latitude REAL,
+        longitude REAL,
+        pause_at TEXT,
+        synced_at TEXT,
+        PRIMARY KEY (warehouse_id, source)
+    )
+    """)
+
     # Первый срез из уже загруженных товаров, чтобы история не начиналась с нуля
     cursor.execute("SELECT COUNT(*) FROM stock_snapshots")
     if cursor.fetchone()[0] == 0:
@@ -503,6 +521,67 @@ def delete_recommendation(rec_id: int):
     cursor.execute("DELETE FROM recommendations WHERE id = ?", (rec_id,))
     conn.commit()
     conn.close()
+
+
+def save_warehouses(items: list, source: str, replace: bool = False) -> int:
+    """Сохраняет справочник складов.
+
+    source — 'seller' (мои склады) или 'ozon' (склады Ozon).
+    replace=True удаляет прежние склады этого источника: список моих
+    складов в Ozon считается полным, поэтому устаревшие записи не нужны.
+    Возвращает число сохраненных складов.
+    """
+    if not items:
+        return 0
+
+    now = datetime.now().isoformat()
+    rows = [
+        (
+            str(item.get("warehouse_id") or ""),
+            source,
+            item.get("name") or "",
+            item.get("address") or "",
+            item.get("warehouse_type") or "",
+            item.get("status") or "",
+            1 if item.get("is_rfbs") else 0,
+            item.get("latitude"),
+            item.get("longitude"),
+            item.get("pause_at"),
+            now,
+        )
+        for item in items
+        if str(item.get("warehouse_id") or "").strip()
+    ]
+    if not rows:
+        return 0
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if replace:
+        cursor.execute("DELETE FROM warehouses WHERE source = ?", (source,))
+    cursor.executemany(
+        """
+        INSERT INTO warehouses (
+            warehouse_id, source, name, address, warehouse_type, status,
+            is_rfbs, latitude, longitude, pause_at, synced_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(warehouse_id, source) DO UPDATE SET
+            name = excluded.name,
+            address = excluded.address,
+            warehouse_type = excluded.warehouse_type,
+            status = excluded.status,
+            is_rfbs = excluded.is_rfbs,
+            latitude = excluded.latitude,
+            longitude = excluded.longitude,
+            pause_at = excluded.pause_at,
+            synced_at = excluded.synced_at
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+    return len(rows)
 
 def show_products():
     """Показывает товары из базы"""

@@ -36,7 +36,13 @@ def test_init_db_creates_all_tables(db):
     finally:
         conn.close()
 
-    assert {"products", "sync_log", "documents", "recommendations"} <= tables
+    assert {
+        "products",
+        "sync_log",
+        "documents",
+        "recommendations",
+        "warehouses",
+    } <= tables
 
 
 def test_save_products_inserts_data_and_sync_log(db):
@@ -237,3 +243,76 @@ def test_delete_recommendation(db):
     db.delete_recommendation(rec_id)
 
     assert fetch_one(db, "SELECT * FROM recommendations") is None
+
+
+def test_save_warehouses_upserts_by_source(db):
+    items = [
+        {
+            "warehouse_id": "111",
+            "name": "казань",
+            "address": "Россия, Казань",
+            "warehouse_type": "fbs",
+            "status": "disabled",
+            "is_rfbs": False,
+            "latitude": 55.8,
+            "longitude": 49.1,
+            "pause_at": None,
+        }
+    ]
+
+    assert db.save_warehouses(items, "seller") == 1
+
+    row = fetch_one(db, "SELECT * FROM warehouses")
+    assert row["warehouse_id"] == "111"
+    assert row["source"] == "seller"
+    assert row["name"] == "казань"
+    assert row["status"] == "disabled"
+    assert row["is_rfbs"] == 0
+    assert row["synced_at"]
+
+    # Повторное сохранение обновляет запись, а не создает дубль
+    updated = dict(items[0], name="Казань-2", status="active")
+    assert db.save_warehouses([updated], "seller") == 1
+    assert fetch_one(db, "SELECT COUNT(*) FROM warehouses")[0] == 1
+
+    row = fetch_one(db, "SELECT * FROM warehouses")
+    assert row["name"] == "Казань-2"
+    assert row["status"] == "active"
+
+
+def test_save_warehouses_replace_removes_stale_rows_of_same_source(db):
+    db.save_warehouses(
+        [
+            {"warehouse_id": "111", "name": "Старый"},
+            {"warehouse_id": "222", "name": "Еще один"},
+        ],
+        "seller",
+    )
+    db.save_warehouses(
+        [{"warehouse_id": "333", "name": "Новый"}], "seller", replace=True
+    )
+
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        ids = [row[0] for row in conn.execute("SELECT warehouse_id FROM warehouses")]
+    finally:
+        conn.close()
+
+    assert ids == ["333"]
+
+
+def test_save_warehouses_keeps_other_sources(db):
+    db.save_warehouses([{"warehouse_id": "111", "name": "Мой"}], "seller")
+    db.save_warehouses([{"warehouse_id": "222", "name": "Ozon"}], "ozon", replace=True)
+
+    assert fetch_one(
+        db, "SELECT * FROM warehouses WHERE warehouse_id = '111'"
+    ) is not None
+    assert fetch_one(
+        db, "SELECT * FROM warehouses WHERE warehouse_id = '222'"
+    ) is not None
+
+
+def test_save_warehouses_skips_rows_without_id(db):
+    assert db.save_warehouses([{"name": "Без id"}], "seller") == 0
+    assert fetch_one(db, "SELECT COUNT(*) FROM warehouses")[0] == 0

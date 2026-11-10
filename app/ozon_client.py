@@ -26,6 +26,14 @@ SALES_MAX_DAYS = 90
 # Временные сбои Ozon: лимит запросов (429) и ошибки сервера (500/502/503)
 RETRYABLE_STATUSES = {429, 500, 502, 503}
 
+# Склады продавца (FBS) и склады Ozon (FBO)
+WAREHOUSE_LIST_URL = "/v2/warehouse/list"
+WAREHOUSE_PAGE_SIZE = 200  # Ozon не принимает limit больше 200
+OZON_WAREHOUSE_SEARCH_URL = "/v1/warehouse/fbo/list"
+OZON_WAREHOUSE_SEARCH_MIN_LENGTH = 4
+# Ozon принимает только числовые значения enum: 1 и 2 — доступные типы поставок
+OZON_WAREHOUSE_SUPPLY_TYPES = [1, 2]
+
 
 class OzonApiError(Exception):
     """Ошибка обращения к Ozon Seller API"""
@@ -398,6 +406,100 @@ def get_sales(days: int = 30, client: httpx.Client | None = None):
         client = _build_client()
     try:
         return _fetch_sales(client, days)
+    finally:
+        if own_client:
+            client.close()
+
+
+def _parse_seller_warehouse(row: dict) -> dict:
+    """Разбирает склад продавца из /v2/warehouse/list."""
+    address_info = row.get("address_info") or {}
+    return {
+        "warehouse_id": str(row.get("warehouse_id") or ""),
+        "name": row.get("name") or "",
+        "address": address_info.get("address") or "",
+        "warehouse_type": row.get("warehouse_type") or "",
+        "status": row.get("status") or "",
+        "is_rfbs": bool(row.get("is_rfbs")),
+        "latitude": address_info.get("latitude"),
+        "longitude": address_info.get("longitude"),
+        "pause_at": row.get("pause_at"),
+    }
+
+
+def _parse_ozon_warehouse(row: dict) -> dict:
+    """Разбирает склад Ozon из /v1/warehouse/fbo/list.
+
+    Ozon в этом методе не отдаёт статус приёма поставок — только тип,
+    адрес и координаты. Не придумываем статус, оставляем пустым.
+    """
+    coordinates = row.get("coordinates") or {}
+    return {
+        "warehouse_id": str(row.get("warehouse_id") or ""),
+        "name": row.get("name") or "",
+        "address": row.get("address") or "",
+        "warehouse_type": row.get("warehouse_type") or "",
+        "status": "",
+        "is_rfbs": False,
+        "latitude": coordinates.get("latitude"),
+        "longitude": coordinates.get("longitude"),
+        "pause_at": None,
+    }
+
+
+def get_seller_warehouses(client: httpx.Client | None = None):
+    """Возвращает склады продавца (FBS/rFBS) с их реальным статусом."""
+    own_client = client is None
+    if own_client:
+        client = _build_client()
+    try:
+        warehouses = []
+        offset = 0
+        while True:
+            response = _request(
+                client,
+                WAREHOUSE_LIST_URL,
+                {"limit": WAREHOUSE_PAGE_SIZE, "offset": offset},
+            )
+            batch = response.json().get("warehouses") or []
+            warehouses.extend(_parse_seller_warehouse(row) for row in batch)
+            if len(batch) < WAREHOUSE_PAGE_SIZE:
+                break
+            offset += WAREHOUSE_PAGE_SIZE
+            time.sleep(SALES_PAGE_PAUSE_SECONDS)
+        return warehouses
+    finally:
+        if own_client:
+            client.close()
+
+
+def search_ozon_warehouses(search: str, client: httpx.Client | None = None):
+    """Ищет склады Ozon (FBO) по названию или городу.
+
+    Ozon требует минимум 4 символа. Возвращает тип, адрес и координаты;
+    статус приёма поставок через этот метод недоступен.
+    """
+    search = (search or "").strip()
+    if len(search) < OZON_WAREHOUSE_SEARCH_MIN_LENGTH:
+        raise ValueError(
+            f"Для поиска складов Ozon нужно минимум "
+            f"{OZON_WAREHOUSE_SEARCH_MIN_LENGTH} символа"
+        )
+
+    own_client = client is None
+    if own_client:
+        client = _build_client()
+    try:
+        response = _request(
+            client,
+            OZON_WAREHOUSE_SEARCH_URL,
+            {
+                "filter_by_supply_type": OZON_WAREHOUSE_SUPPLY_TYPES,
+                "search": search,
+            },
+        )
+        rows = response.json().get("search") or []
+        return [_parse_ozon_warehouse(row) for row in rows]
     finally:
         if own_client:
             client.close()

@@ -15,13 +15,18 @@ from app.database import (
     delete_recommendation,
     init_db,
     log_sync,
+    save_warehouses,
     update_costs_bulk,
     update_product_economics,
     update_recommendation,
 )
 from app.economics import UnitEconomics, to_float
 from app.inventory import STALE_STOCK_DAYS
-from app.ozon_client import OzonApiError
+from app.ozon_client import (
+    OzonApiError,
+    get_seller_warehouses,
+    search_ozon_warehouses,
+)
 from app.recommendations import (
     OPEN_RECOMMENDATION_STATUSES,
     RECOMMENDATION_KIND_LABELS,
@@ -32,6 +37,11 @@ from app.recommendations import (
 from app.scheduler import create_background_scheduler, interval_hours_from_env
 from app.stock_analysis import build_stock_table
 from app.sync import sync_products, sync_sales
+from app.warehouses import (
+    seller_status_label,
+    warehouse_map_url,
+    warehouse_type_label,
+)
 
 # Настраиваем внешний вид страницы
 st.set_page_config(page_title="OZON JARVIS", page_icon="📦", layout="wide")
@@ -91,6 +101,18 @@ def load_recommendations() -> pd.DataFrame:
             )
     except sqlite3.Error as e:
         st.error(f"Не удалось прочитать журнал рекомендаций: {e}")
+        return pd.DataFrame()
+
+
+def load_warehouses() -> pd.DataFrame:
+    """Читает справочник складов."""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM warehouses ORDER BY source, name", conn
+            )
+    except sqlite3.Error as e:
+        st.error(f"Не удалось прочитать справочник складов: {e}")
         return pd.DataFrame()
 
 
@@ -639,6 +661,149 @@ if not df_products.empty:
                     width="stretch",
                     hide_index=True,
                 )
+
+# --- КАРТА СКЛАДОВ OZON ---
+st.subheader("Карта складов Ozon")
+st.caption(
+    "Мои склады со статусом приёма из Ozon и справочник складов Ozon. "
+    "Для складов Ozon API не отдаёт статус приёма поставок — показываем "
+    "только тип, адрес и координаты."
+)
+
+df_warehouses = load_warehouses()
+col_my, col_ozon = st.columns(2)
+
+with col_my:
+    st.markdown("**🏬 Мои склады (FBS)**")
+    my_warehouses = (
+        df_warehouses[df_warehouses["source"] == "seller"].copy()
+        if not df_warehouses.empty
+        else pd.DataFrame()
+    )
+
+    if my_warehouses.empty:
+        st.info("Склады продавца ещё не загружены — нажмите кнопку ниже.")
+    else:
+        my_warehouses["status_label"] = my_warehouses["status"].map(
+            seller_status_label
+        )
+        my_warehouses["type_label"] = [
+            warehouse_type_label(value, "seller")
+            for value in my_warehouses["warehouse_type"]
+        ]
+        my_warehouses["map_url"] = [
+            warehouse_map_url(lat, lon)
+            for lat, lon in zip(my_warehouses["latitude"], my_warehouses["longitude"])
+        ]
+        my_warehouses["synced_at"] = pd.to_datetime(
+            my_warehouses["synced_at"], errors="coerce"
+        ).dt.strftime("%d.%m.%Y %H:%M")
+
+        st.dataframe(
+            my_warehouses[
+                ["name", "status_label", "type_label", "address", "map_url", "synced_at"]
+            ].rename(
+                columns={
+                    "name": "Склад",
+                    "status_label": "Статус",
+                    "type_label": "Тип",
+                    "address": "Адрес",
+                    "map_url": "Карта",
+                    "synced_at": "Обновлено",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Карта": st.column_config.LinkColumn(
+                    "Карта", display_text="Открыть"
+                )
+            },
+        )
+
+    if st.button("🔄 Обновить мои склады", key="warehouses_refresh_seller"):
+        with st.spinner("Запрашиваем склады продавца в Ozon..."):
+            try:
+                items = get_seller_warehouses()
+            except OzonApiError as e:
+                log_sync("WAREHOUSE_LIST", "error", str(e))
+                st.error(f"Не удалось загрузить склады продавца: {e}")
+            else:
+                saved = save_warehouses(items, "seller", replace=True)
+                if saved:
+                    st.success(f"Склады продавца обновлены: {saved}.")
+                    st.rerun()
+                else:
+                    st.warning("Ozon не вернул ни одного склада продавца.")
+
+with col_ozon:
+    st.markdown("**🏭 Склады Ozon (FBO)**")
+    ozon_warehouses = (
+        df_warehouses[df_warehouses["source"] == "ozon"].copy()
+        if not df_warehouses.empty
+        else pd.DataFrame()
+    )
+
+    if ozon_warehouses.empty:
+        st.info("Склады Ozon ещё не искали — введите город или название.")
+    else:
+        ozon_warehouses["type_label"] = [
+            warehouse_type_label(value, "ozon")
+            for value in ozon_warehouses["warehouse_type"]
+        ]
+        ozon_warehouses["map_url"] = [
+            warehouse_map_url(lat, lon)
+            for lat, lon in zip(ozon_warehouses["latitude"], ozon_warehouses["longitude"])
+        ]
+        st.caption("Показаны все склады, найденные ранее.")
+        st.dataframe(
+            ozon_warehouses[
+                ["name", "type_label", "address", "map_url"]
+            ].rename(
+                columns={
+                    "name": "Склад",
+                    "type_label": "Тип",
+                    "address": "Адрес",
+                    "map_url": "Карта",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Карта": st.column_config.LinkColumn(
+                    "Карта", display_text="Открыть"
+                )
+            },
+        )
+
+    with st.form("ozon_warehouse_search", clear_on_submit=False):
+        search_query = st.text_input(
+            "Город или название склада (минимум 4 символа)",
+            key="ozon_warehouse_query",
+        )
+        search_submitted = st.form_submit_button("🔍 Найти склады Ozon")
+
+    if search_submitted:
+        query = search_query.strip()
+        if len(query) < 4:
+            st.warning("Для поиска складов Ozon нужно минимум 4 символа.")
+        else:
+            with st.spinner("Ищем склады Ozon..."):
+                try:
+                    items = search_ozon_warehouses(query)
+                except OzonApiError as e:
+                    log_sync("WAREHOUSE_FBO_SEARCH", "error", str(e))
+                    st.error(f"Не удалось найти склады Ozon: {e}")
+                else:
+                    saved = save_warehouses(items, "ozon")
+                    if saved:
+                        st.success(f"Найдено и сохранено складов: {saved}.")
+                        st.rerun()
+                    else:
+                        st.warning(
+                            "Ozon не вернул склады по этому запросу. "
+                            "Попробуйте другой город или название."
+                        )
 
 # --- ЖУРНАЛ РЕКОМЕНДАЦИЙ ---
 st.subheader("Журнал рекомендаций")

@@ -5,16 +5,21 @@ import pytest
 
 from app.ozon_client import (
     BASE_URL,
+    WAREHOUSE_PAGE_SIZE,
     OzonApiError,
     _extract_page,
     _extract_sku,
     _paginate_offset,
     _parse_number,
+    _parse_ozon_warehouse,
     _parse_sales_row,
+    _parse_seller_warehouse,
     _request,
     _server_time,
     get_products,
     get_sales,
+    get_seller_warehouses,
+    search_ozon_warehouses,
 )
 
 
@@ -280,3 +285,113 @@ def test_get_sales_sends_expected_payload_and_parses_rows():
 def test_get_sales_validates_period(days):
     with pytest.raises(ValueError):
         get_sales(days=days)
+
+
+def test_parse_seller_warehouse_reads_status_and_address():
+    parsed = _parse_seller_warehouse(
+        {
+            "warehouse_id": 1020005023494460,
+            "name": "казань",
+            "warehouse_type": "fbs",
+            "status": "disabled",
+            "is_rfbs": False,
+            "pause_at": None,
+            "address_info": {
+                "address": "Россия, Казань, Чистопольская улица, 19а",
+                "latitude": 55.81987,
+                "longitude": 49.114884,
+            },
+        }
+    )
+
+    assert parsed == {
+        "warehouse_id": "1020005023494460",
+        "name": "казань",
+        "address": "Россия, Казань, Чистопольская улица, 19а",
+        "warehouse_type": "fbs",
+        "status": "disabled",
+        "is_rfbs": False,
+        "latitude": 55.81987,
+        "longitude": 49.114884,
+        "pause_at": None,
+    }
+
+
+def test_parse_ozon_warehouse_does_not_invent_status():
+    parsed = _parse_ozon_warehouse(
+        {
+            "warehouse_id": 15431806189000,
+            "warehouse_type": "WAREHOUSE_TYPE_FULL_FILLMENT",
+            "coordinates": {"latitude": 56.127205, "longitude": 37.211363},
+            "address": "Россия, Московская область, Хоругвино",
+            "name": "ХОРУГВИНО_РФЦ",
+        }
+    )
+
+    assert parsed["warehouse_id"] == "15431806189000"
+    assert parsed["name"] == "ХОРУГВИНО_РФЦ"
+    assert parsed["warehouse_type"] == "WAREHOUSE_TYPE_FULL_FILLMENT"
+    assert parsed["latitude"] == 56.127205
+    assert parsed["longitude"] == 37.211363
+    # Ozon не отдаёт статус приёма в этом методе — не выдумываем его
+    assert parsed["status"] == ""
+
+
+def test_get_seller_warehouses_walks_pages(monkeypatch):
+    offsets = []
+    full_page = [
+        {"warehouse_id": index, "name": f"Склад {index}"}
+        for index in range(WAREHOUSE_PAGE_SIZE)
+    ]
+
+    def handler(request):
+        payload = json.loads(request.content)
+        offsets.append(payload["offset"])
+        if payload["offset"] == 0:
+            return httpx.Response(200, json={"warehouses": full_page})
+        return httpx.Response(
+            200, json={"warehouses": [{"warehouse_id": 999, "name": "Последний"}]}
+        )
+
+    monkeypatch.setattr("app.ozon_client.time.sleep", lambda seconds: None)
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    warehouses = get_seller_warehouses(client=client)
+
+    assert len(warehouses) == WAREHOUSE_PAGE_SIZE + 1
+    assert warehouses[-1]["warehouse_id"] == "999"
+    assert offsets == [0, WAREHOUSE_PAGE_SIZE]
+
+
+def test_search_ozon_warehouses_sends_expected_payload():
+    captured = {}
+
+    def handler(request):
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "search": [
+                    {
+                        "warehouse_id": 15431806189000,
+                        "warehouse_type": "WAREHOUSE_TYPE_FULL_FILLMENT",
+                        "coordinates": {"latitude": 56.127205, "longitude": 37.211363},
+                        "address": "Россия, Московская область, Хоругвино",
+                        "name": "ХОРУГВИНО_РФЦ",
+                    }
+                ]
+            },
+        )
+
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    warehouses = search_ozon_warehouses("Хоругвино", client=client)
+
+    assert captured["filter_by_supply_type"] == [1, 2]
+    assert captured["search"] == "Хоругвино"
+    assert [item["name"] for item in warehouses] == ["ХОРУГВИНО_РФЦ"]
+
+
+def test_search_ozon_warehouses_requires_four_characters():
+    with pytest.raises(ValueError, match="минимум 4"):
+        search_ozon_warehouses("abc")

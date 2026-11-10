@@ -1,8 +1,9 @@
+import re
 import time
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 
 import httpx
-from datetime import datetime
-from email.utils import parsedate_to_datetime
 
 from app.config import OZON_CLIENT_ID, OZON_API_KEY
 
@@ -12,6 +13,15 @@ PLACEHOLDERS = {None, "", "ваш_числовой_client_id", "ваш_api_key"}
 # Сколько товаров запрашивать за одну страницу / один запрос
 PAGE_SIZE = 1000
 INFO_LIST_CHUNK_SIZE = 500
+
+# Статистика продаж (Ozon Analytics API)
+SALES_URL = "/v1/analytics/data"
+SALES_METRICS = ["ordered_units", "revenue"]
+SALES_DIMENSIONS = ["day", "sku"]
+SALES_PAGE_SIZE = 1000
+# Ozon ограничивает частоту запросов аналитики — между страницами делаем паузу
+SALES_PAGE_PAUSE_SECONDS = 1.0
+SALES_MAX_DAYS = 90
 
 # Временные сбои Ozon: лимит запросов (429) и ошибки сервера (500/502/503)
 RETRYABLE_STATUSES = {429, 500, 502, 503}
@@ -132,6 +142,83 @@ def _paginate(client: httpx.Client, url: str, base_payload: dict, token_key: str
             break
         token = new_token
     return items, first_response
+
+
+def _paginate_offset(
+    client: httpx.Client,
+    url: str,
+    base_payload: dict,
+    page_size: int = SALES_PAGE_SIZE,
+    pause_seconds: float = SALES_PAGE_PAUSE_SECONDS,
+):
+    """Проходит страницы через offset/limit (аналитика продаж Ozon)."""
+    items = []
+    offset = 0
+    while True:
+        payload = dict(base_payload)
+        payload["limit"] = page_size
+        payload["offset"] = offset
+        response = _request(client, url, payload)
+        result = response.json().get("result") or {}
+        batch = result.get("data") or []
+        items.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+        if pause_seconds:
+            time.sleep(pause_seconds)
+    return items
+
+
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_sales_row(row: dict):
+    """Разбирает строку ответа аналитики: dimensions=[день, SKU], metrics=[шт., выручка]."""
+    dimensions = row.get("dimensions") or []
+    metrics = row.get("metrics") or []
+    day = None
+    sku = None
+    for dimension in dimensions:
+        dim_id = str(dimension.get("id") or "")
+        if _DAY_RE.match(dim_id):
+            day = dim_id
+        elif dim_id:
+            sku = dim_id
+    if not day or not sku:
+        return None
+
+    ordered = _parse_number(metrics[0]) if len(metrics) > 0 else 0
+    revenue = _parse_number(metrics[1]) if len(metrics) > 1 else 0
+    return {
+        "sku": sku,
+        "day": day,
+        "ordered_units": int(ordered or 0),
+        "revenue": float(revenue or 0),
+    }
+
+
+def _fetch_sales(client: httpx.Client, days: int):
+    """Шаг 5: ежедневные продажи по каждому SKU за период."""
+    date_to = datetime.now().date()
+    date_from = date_to - timedelta(days=days - 1)
+    rows = _paginate_offset(
+        client,
+        SALES_URL,
+        {
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "metrics": SALES_METRICS,
+            "dimension": SALES_DIMENSIONS,
+            "filters": [],
+        },
+    )
+    sales = []
+    for row in rows:
+        parsed = _parse_sales_row(row)
+        if parsed:
+            sales.append(parsed)
+    return sales
 
 
 def _parse_number(value):
@@ -293,3 +380,24 @@ def get_products(client: httpx.Client | None = None):
             "ozon_updated_at": ozon_time.isoformat(),
         })
     return products
+
+
+def get_sales(days: int = 30, client: httpx.Client | None = None):
+    """Возвращает ежедневные продажи по SKU за последние `days` дней.
+
+    Каждая запись: sku, day (YYYY-MM-DD), ordered_units, revenue.
+    Ozon отдает статистику максимум за 3 месяца, поэтому days <= 90.
+    """
+    if days < 1:
+        raise ValueError("days должен быть >= 1")
+    if days > SALES_MAX_DAYS:
+        raise ValueError(f"Ozon отдает статистику максимум за {SALES_MAX_DAYS} дней")
+
+    own_client = client is None
+    if own_client:
+        client = _build_client()
+    try:
+        return _fetch_sales(client, days)
+    finally:
+        if own_client:
+            client.close()

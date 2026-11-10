@@ -90,6 +90,18 @@ def init_db():
         created_at TEXT
     )
     """)
+
+    # Ежедневные продажи по SKU (Ozon Analytics API)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sales_daily (
+        sku TEXT NOT NULL,
+        day TEXT NOT NULL,
+        ordered_units INTEGER DEFAULT 0,
+        revenue REAL DEFAULT 0,
+        synced_at TEXT,
+        PRIMARY KEY (sku, day)
+    )
+    """)
     conn.commit()
     conn.close()
 
@@ -151,6 +163,49 @@ def save_products(items: list):
     conn.commit()
     conn.close()
     print(f"Успешно сохранено товаров в базу: {len(items)}")
+
+
+def save_sales(items: list) -> int:
+    """Сохраняет ежедневные продажи по SKU, обновляя уже известные дни.
+
+    Возвращает число сохраненных строк. Пустой ответ Ozon честно пишем
+    в журнал как предупреждение, а не как успех.
+    """
+    if not items:
+        log_sync("OZON_ANALYTICS", "warning", "Ozon вернул пустую статистику продаж")
+        return 0
+
+    now = datetime.now().isoformat()
+    rows = [
+        (
+            str(item["sku"]),
+            str(item["day"]),
+            int(item.get("ordered_units") or 0),
+            float(item.get("revenue") or 0),
+            now,
+        )
+        for item in items
+    ]
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.executemany(
+        """
+        INSERT INTO sales_daily (sku, day, ordered_units, revenue, synced_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(sku, day) DO UPDATE SET
+            ordered_units = excluded.ordered_units,
+            revenue = excluded.revenue,
+            synced_at = excluded.synced_at
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+    log_sync("OZON_ANALYTICS", "success", f"Загружено строк продаж: {len(rows)}")
+    print(f"Успешно сохранено строк продаж: {len(rows)}")
+    return len(rows)
 
 
 def log_sync(source: str, status: str, message: str):

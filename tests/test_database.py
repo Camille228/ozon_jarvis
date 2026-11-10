@@ -103,6 +103,37 @@ def test_log_sync_writes_error(db):
     assert log["message"] == "Ключи не заданы"
 
 
+def test_save_sales_upserts_rows_and_logs(db):
+    rows = [
+        {"sku": "111", "day": "2026-11-10", "ordered_units": 3, "revenue": 3000.0},
+        {"sku": "222", "day": "2026-11-10", "ordered_units": 1, "revenue": 500.0},
+    ]
+    assert db.save_sales(rows) == 2
+
+    assert fetch_one(db, "SELECT COUNT(*) FROM sales_daily")[0] == 2
+    row = fetch_one(db, "SELECT * FROM sales_daily WHERE sku='111'")
+    assert row["ordered_units"] == 3
+    assert row["revenue"] == 3000.0
+
+    # Повторная синхронизация обновляет день, а не дублирует его
+    db.save_sales(
+        [{"sku": "111", "day": "2026-11-10", "ordered_units": 5, "revenue": 4500.0}]
+    )
+    assert fetch_one(db, "SELECT COUNT(*) FROM sales_daily")[0] == 2
+    assert fetch_one(db, "SELECT ordered_units FROM sales_daily WHERE sku='111'")[0] == 5
+
+    log = fetch_one(db, "SELECT * FROM sync_log ORDER BY id DESC LIMIT 1")
+    assert log["source"] == "OZON_ANALYTICS"
+    assert log["status"] == "success"
+
+
+def test_save_sales_empty_response_is_a_warning(db):
+    assert db.save_sales([]) == 0
+
+    log = fetch_one(db, "SELECT * FROM sync_log ORDER BY id DESC LIMIT 1")
+    assert log["status"] == "warning"
+
+
 def test_documents_add_and_delete(db):
     db.add_document("Сертификат", "Сертификат", "111", "2026-12-01", "важно")
     doc = fetch_one(db, "SELECT * FROM documents")

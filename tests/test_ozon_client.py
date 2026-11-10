@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -6,10 +8,13 @@ from app.ozon_client import (
     OzonApiError,
     _extract_page,
     _extract_sku,
+    _paginate_offset,
     _parse_number,
+    _parse_sales_row,
     _request,
     _server_time,
     get_products,
+    get_sales,
 )
 
 
@@ -171,3 +176,107 @@ def test_get_products_merges_list_info_stocks_and_prices():
     assert second["quantity_fbo"] == 0
     assert second["quantity_fbs"] == 0
     assert second["commission_rate_ozon_fbs"] is None
+
+
+def test_parse_sales_row_reads_day_sku_and_metrics():
+    row = {
+        "dimensions": [
+            {"id": "2026-11-10", "name": ""},
+            {"id": "111", "name": "Товар"},
+        ],
+        "metrics": [3, 2990.5],
+    }
+
+    assert _parse_sales_row(row) == {
+        "sku": "111",
+        "day": "2026-11-10",
+        "ordered_units": 3,
+        "revenue": 2990.5,
+    }
+
+
+def test_parse_sales_row_does_not_depend_on_dimension_order():
+    row = {
+        "dimensions": [
+            {"id": "111", "name": "Товар"},
+            {"id": "2026-11-10", "name": ""},
+        ],
+        "metrics": [1, 100],
+    }
+
+    parsed = _parse_sales_row(row)
+
+    assert parsed["sku"] == "111"
+    assert parsed["day"] == "2026-11-10"
+
+
+def test_parse_sales_row_skips_incomplete_rows():
+    assert _parse_sales_row({"dimensions": [], "metrics": [1, 2]}) is None
+    assert _parse_sales_row({"dimensions": [{"id": "111"}], "metrics": []}) is None
+
+
+def test_paginate_offset_walks_pages(monkeypatch):
+    pages = {
+        0: [{"n": 1}, {"n": 2}],
+        2: [{"n": 3}],
+    }
+    offsets = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        offsets.append(payload["offset"])
+        return httpx.Response(200, json={"result": {"data": pages[payload["offset"]]}})
+
+    monkeypatch.setattr("app.ozon_client.time.sleep", lambda seconds: None)
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    items = _paginate_offset(client, "/v1/analytics/data", {}, page_size=2)
+
+    assert [item["n"] for item in items] == [1, 2, 3]
+    assert offsets == [0, 2]
+
+
+def test_get_sales_sends_expected_payload_and_parses_rows():
+    captured = {}
+
+    def handler(request):
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "data": [
+                        {
+                            "dimensions": [
+                                {"id": "2026-11-10", "name": ""},
+                                {"id": "111", "name": "Товар"},
+                            ],
+                            "metrics": [3, 2990.5],
+                        }
+                    ]
+                }
+            },
+        )
+
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    sales = get_sales(days=30, client=client)
+
+    assert sales == [
+        {
+            "sku": "111",
+            "day": "2026-11-10",
+            "ordered_units": 3,
+            "revenue": 2990.5,
+        }
+    ]
+    assert captured["metrics"] == ["ordered_units", "revenue"]
+    assert captured["dimension"] == ["day", "sku"]
+    assert captured["limit"] == 1000
+    assert captured["offset"] == 0
+
+
+@pytest.mark.parametrize("days", [0, -1, 91])
+def test_get_sales_validates_period(days):
+    with pytest.raises(ValueError):
+        get_sales(days=days)

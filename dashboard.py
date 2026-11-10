@@ -12,11 +12,18 @@ from app.database import (
     init_db,
     log_sync,
     save_products,
+    save_sales,
     update_costs_bulk,
     update_product_economics,
 )
 from app.economics import UnitEconomics, to_float
-from app.ozon_client import OzonApiError, get_products
+from app.inventory import (
+    STOCK_STATUS_LABELS,
+    average_daily_sales,
+    days_of_stock,
+    stock_status,
+)
+from app.ozon_client import OzonApiError, get_products, get_sales
 
 # Настраиваем внешний вид страницы
 st.set_page_config(page_title="OZON JARVIS", page_icon="📦", layout="wide")
@@ -34,6 +41,16 @@ def load_products() -> pd.DataFrame:
             return pd.read_sql_query("SELECT * FROM products", conn)
     except sqlite3.Error as e:
         st.error(f"Не удалось прочитать товары из базы: {e}")
+        return pd.DataFrame()
+
+
+def load_sales() -> pd.DataFrame:
+    """Читает ежедневную статистику продаж."""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            return pd.read_sql_query("SELECT * FROM sales_daily", conn)
+    except sqlite3.Error as e:
+        st.error(f"Не удалось прочитать статистику продаж: {e}")
         return pd.DataFrame()
 
 
@@ -115,21 +132,39 @@ except sqlite3.Error as e:
 st.divider()
 
 # --- БЛОК УПРАВЛЕНИЯ ---
-if st.button("🔄 Обновить данные из Ozon", type="primary"):
-    with st.spinner("Стучимся в Ozon и обновляем базу..."):
-        try:
-            products = get_products()
-        except OzonApiError as e:
-            log_sync("OZON_API", "error", str(e))
-            st.error(f"Синхронизация не удалась: {e}")
-        else:
-            if products:
-                save_products(products)
-                st.success(f"Успешно обновлено! Получено товаров: {len(products)}")
-                st.rerun()
+col_sync_products, col_sync_sales = st.columns(2)
+
+with col_sync_products:
+    if st.button("🔄 Обновить товары из Ozon", type="primary"):
+        with st.spinner("Стучимся в Ozon и обновляем базу..."):
+            try:
+                products = get_products()
+            except OzonApiError as e:
+                log_sync("OZON_API", "error", str(e))
+                st.error(f"Синхронизация не удалась: {e}")
             else:
-                log_sync("OZON_API", "warning", "Ozon вернул пустой список товаров")
-                st.warning("Товары не найдены (проверьте, есть ли товары в кабинете продавца).")
+                if products:
+                    save_products(products)
+                    st.success(f"Успешно обновлено! Получено товаров: {len(products)}")
+                    st.rerun()
+                else:
+                    log_sync("OZON_API", "warning", "Ozon вернул пустой список товаров")
+                    st.warning("Товары не найдены (проверьте, есть ли товары в кабинете продавца).")
+
+with col_sync_sales:
+    if st.button("📊 Обновить продажи (30 дней)"):
+        with st.spinner("Запрашиваем статистику продаж в Ozon..."):
+            try:
+                sales = get_sales(30)
+            except OzonApiError as e:
+                log_sync("OZON_ANALYTICS", "error", str(e))
+                st.error(f"Не удалось загрузить продажи: {e}")
+            else:
+                if save_sales(sales):
+                    st.success(f"Продажи обновлены: {len(sales)} строк.")
+                    st.rerun()
+                else:
+                    st.warning("Ozon не вернул статистику продаж за период.")
 
 st.divider()
 
@@ -324,6 +359,153 @@ else:
     col_profit.metric("Прибыль в сценарии", f"{scenario_econ.profit:,.2f} руб.")
     col_margin.metric("Маржа", f"{scenario_econ.margin:.1f}%")
     col_ad.metric("Расход на рекламу", f"{scenario_econ.ad_cost:,.2f} руб.")
+
+# --- БЕЗОПАСНЫЙ ОСТАТОК ---
+if not df_products.empty:
+    st.subheader("Безопасный остаток")
+    df_sales = load_sales()
+
+    if df_sales.empty:
+        st.info(
+            "Нет данных о продажах. Нажмите «Обновить продажи», чтобы рассчитать, "
+            "на сколько дней хватит остатка."
+        )
+    else:
+        period_days = st.selectbox(
+            "Период для расчёта, дней",
+            [7, 14, 30],
+            index=2,
+            key="stock_period_days",
+        )
+
+        sales = df_sales.copy()
+        sales["day"] = pd.to_datetime(sales["day"], errors="coerce")
+        sales["ordered_units"] = pd.to_numeric(
+            sales["ordered_units"], errors="coerce"
+        ).fillna(0)
+        sales["revenue"] = pd.to_numeric(sales["revenue"], errors="coerce").fillna(0)
+
+        # Считаем период от последнего дня, за который есть данные: Ozon может
+        # отдавать статистику с задержкой, и «последние 30 дней от сегодня»
+        # оказались бы короче на день-два.
+        sales_end = sales["day"].max()
+        if pd.isna(sales_end):
+            st.info("В статистике продаж нет корректных дат. Обновите данные.")
+            recent = sales.iloc[0:0]
+        else:
+            period_start = sales_end - pd.Timedelta(days=period_days - 1)
+            recent = sales[(sales["day"] >= period_start) & (sales["day"] <= sales_end)]
+            st.caption(
+                f"Период: {period_start.strftime('%d.%m.%Y')} — "
+                f"{sales_end.strftime('%d.%m.%Y')}"
+            )
+
+        if recent.empty:
+            st.info("За выбранный период продаж нет. Обновите статистику.")
+        else:
+            observed_days = int((recent["day"].max() - recent["day"].min()).days) + 1
+            divisor = max(1, min(period_days, observed_days))
+
+            agg = recent.groupby("sku", as_index=False).agg(
+                sold=("ordered_units", "sum"),
+                revenue=("revenue", "sum"),
+            )
+            agg["avg_daily"] = [average_daily_sales(u, divisor) for u in agg["sold"]]
+
+            stock = df_products[["sku", "name", "quantity_fbo", "quantity_fbs"]].copy()
+            stock["quantity_fbo"] = pd.to_numeric(
+                stock["quantity_fbo"], errors="coerce"
+            ).fillna(0)
+            stock["quantity_fbs"] = pd.to_numeric(
+                stock["quantity_fbs"], errors="coerce"
+            ).fillna(0)
+            stock["stock_total"] = stock["quantity_fbo"] + stock["quantity_fbs"]
+            stock = stock.merge(agg, on="sku", how="left")
+            stock[["sold", "revenue", "avg_daily"]] = stock[
+                ["sold", "revenue", "avg_daily"]
+            ].fillna(0)
+
+            stock["days_left"] = [
+                days_of_stock(s, a)
+                for s, a in zip(stock["stock_total"], stock["avg_daily"])
+            ]
+            stock["status"] = [
+                stock_status(d, s)
+                for d, s in zip(stock["days_left"], stock["stock_total"])
+            ]
+            stock["status_label"] = stock["status"].map(STOCK_STATUS_LABELS)
+            stock["days_left_display"] = [
+                "—" if pd.isna(d) else f"{d:.1f}" for d in stock["days_left"]
+            ]
+
+            critical_count = int(stock["status"].isin(["out", "critical"]).sum())
+            col_sold, col_revenue, col_attention = st.columns(3)
+            col_sold.metric("Заказано за период", f"{int(stock['sold'].sum())} шт.")
+            col_revenue.metric("Выручка за период", f"{stock['revenue'].sum():,.2f} руб.")
+            col_attention.metric("Требуют внимания", f"{critical_count} SKU")
+
+            stock["_sort_days"] = [
+                float("inf") if pd.isna(d) else d for d in stock["days_left"]
+            ]
+            stock = stock.sort_values("_sort_days").drop(columns="_sort_days")
+
+            stock_display = stock.rename(
+                columns={
+                    "sku": "SKU",
+                    "name": "Название",
+                    "quantity_fbo": "FBO",
+                    "quantity_fbs": "FBS",
+                    "stock_total": "Всего",
+                    "sold": f"Заказано за {period_days} дн.",
+                    "revenue": "Выручка",
+                    "avg_daily": "В среднем в день",
+                    "days_left_display": "Хватит, дн.",
+                    "status_label": "Статус",
+                }
+            )[
+                [
+                    "SKU",
+                    "Название",
+                    "FBO",
+                    "FBS",
+                    "Всего",
+                    f"Заказано за {period_days} дн.",
+                    "Выручка",
+                    "В среднем в день",
+                    "Хватит, дн.",
+                    "Статус",
+                ]
+            ]
+            st.dataframe(stock_display, width="stretch", hide_index=True)
+
+            unmatched = set(recent["sku"]) - set(df_products["sku"])
+            if unmatched:
+                st.caption(
+                    f"ℹ️ В статистике есть {len(unmatched)} SKU, которых нет в списке "
+                    "товаров (возможно, архивные) — они не участвуют в расчёте."
+                )
+
+            last_sales_sync = pd.to_datetime(df_sales["synced_at"], errors="coerce").max()
+            if pd.notna(last_sales_sync):
+                st.caption(
+                    f"Статистика продаж обновлена: {last_sales_sync.strftime('%d.%m.%Y %H:%M')}"
+                )
+
+            with st.expander("Продажи по дням"):
+                daily = recent.sort_values(["day", "sku"], ascending=[False, True])
+                st.dataframe(
+                    daily[["day", "sku", "ordered_units", "revenue"]].rename(
+                        columns={
+                            "day": "День",
+                            "sku": "SKU",
+                            "ordered_units": "Заказано, шт.",
+                            "revenue": "Выручка, руб.",
+                        }
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.bar_chart(recent.groupby("day")["ordered_units"].sum())
 
 # --- ДОКУМЕНТЫ ---
 st.subheader("Документы и сроки действия")

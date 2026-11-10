@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta
@@ -11,8 +12,6 @@ from app.database import (
     delete_document,
     init_db,
     log_sync,
-    save_products,
-    save_sales,
     update_costs_bulk,
     update_product_economics,
 )
@@ -25,7 +24,9 @@ from app.inventory import (
     is_stale,
     stock_status,
 )
-from app.ozon_client import OzonApiError, get_products, get_sales
+from app.ozon_client import OzonApiError
+from app.scheduler import create_background_scheduler, interval_hours_from_env
+from app.sync import sync_products, sync_sales
 
 # Настраиваем внешний вид страницы
 st.set_page_config(page_title="OZON JARVIS", page_icon="📦", layout="wide")
@@ -34,6 +35,14 @@ st.title("📦 OZON JARVIS — Система управления")
 
 # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ (миграции схемы products/documents) ---
 init_db()
+
+
+@st.cache_resource
+def start_autosync_scheduler():
+    """Запускает фоновый планировщик один раз на процесс Streamlit."""
+    scheduler = create_background_scheduler()
+    scheduler.start()
+    return scheduler
 
 
 def load_products() -> pd.DataFrame:
@@ -146,36 +155,42 @@ except sqlite3.Error as e:
 st.divider()
 
 # --- БЛОК УПРАВЛЕНИЯ ---
+if os.getenv("JARVIS_AUTOSYNC", "0") == "1":
+    start_autosync_scheduler()
+    st.caption(
+        f"🤖 Автосинхронизация включена: каждые {interval_hours_from_env():g} ч."
+    )
+
 col_sync_products, col_sync_sales = st.columns(2)
 
 with col_sync_products:
     if st.button("🔄 Обновить товары из Ozon", type="primary"):
         with st.spinner("Стучимся в Ozon и обновляем базу..."):
             try:
-                products = get_products()
+                count = sync_products()
             except OzonApiError as e:
                 log_sync("OZON_API", "error", str(e))
                 st.error(f"Синхронизация не удалась: {e}")
             else:
-                if products:
-                    save_products(products)
-                    st.success(f"Успешно обновлено! Получено товаров: {len(products)}")
+                if count:
+                    st.success(f"Успешно обновлено! Получено товаров: {count}")
                     st.rerun()
                 else:
-                    log_sync("OZON_API", "warning", "Ozon вернул пустой список товаров")
-                    st.warning("Товары не найдены (проверьте, есть ли товары в кабинете продавца).")
+                    st.warning(
+                        "Товары не найдены (проверьте, есть ли товары в кабинете продавца)."
+                    )
 
 with col_sync_sales:
     if st.button("📊 Обновить продажи (30 дней)"):
         with st.spinner("Запрашиваем статистику продаж в Ozon..."):
             try:
-                sales = get_sales(30)
+                count = sync_sales(30)
             except OzonApiError as e:
                 log_sync("OZON_ANALYTICS", "error", str(e))
                 st.error(f"Не удалось загрузить продажи: {e}")
             else:
-                if save_sales(sales):
-                    st.success(f"Продажи обновлены: {len(sales)} строк.")
+                if count:
+                    st.success(f"Продажи обновлены: {count} строк.")
                     st.rerun()
                 else:
                     st.warning("Ozon не вернул статистику продаж за период.")

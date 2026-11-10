@@ -9,23 +9,28 @@ import streamlit as st
 from app.database import (
     DB_PATH,
     add_document,
+    add_recommendation,
+    add_recommendations,
     delete_document,
+    delete_recommendation,
     init_db,
     log_sync,
     update_costs_bulk,
     update_product_economics,
+    update_recommendation,
 )
 from app.economics import UnitEconomics, to_float
-from app.inventory import (
-    STALE_STOCK_DAYS,
-    STOCK_STATUS_LABELS,
-    average_daily_sales,
-    days_of_stock,
-    is_stale,
-    stock_status,
-)
+from app.inventory import STALE_STOCK_DAYS
 from app.ozon_client import OzonApiError
+from app.recommendations import (
+    OPEN_RECOMMENDATION_STATUSES,
+    RECOMMENDATION_KIND_LABELS,
+    RECOMMENDATION_STATUS_LABELS,
+    STATUS_BY_LABEL,
+    build_stock_recommendations,
+)
 from app.scheduler import create_background_scheduler, interval_hours_from_env
+from app.stock_analysis import build_stock_table
 from app.sync import sync_products, sync_sales
 
 # Настраиваем внешний вид страницы
@@ -75,6 +80,25 @@ def load_stock_snapshots() -> pd.DataFrame:
     except sqlite3.Error as e:
         st.error(f"Не удалось прочитать историю остатков: {e}")
         return pd.DataFrame()
+
+
+def load_recommendations() -> pd.DataFrame:
+    """Читает журнал рекомендаций."""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM recommendations ORDER BY id DESC", conn
+            )
+    except sqlite3.Error as e:
+        st.error(f"Не удалось прочитать журнал рекомендаций: {e}")
+        return pd.DataFrame()
+
+
+def cell_text(value) -> str:
+    """Превращает значение из таблицы в строку, не превращая пустое в «nan»."""
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
 def economics_for_row(row) -> UnitEconomics:
@@ -407,79 +431,29 @@ if not df_products.empty:
             key="stock_period_days",
         )
 
-        sales = df_sales.copy()
-        sales["day"] = pd.to_datetime(sales["day"], errors="coerce")
-        sales["ordered_units"] = pd.to_numeric(
-            sales["ordered_units"], errors="coerce"
-        ).fillna(0)
-        sales["revenue"] = pd.to_numeric(sales["revenue"], errors="coerce").fillna(0)
+        has_dates = not pd.to_datetime(df_sales["day"], errors="coerce").dropna().empty
+        analysis = (
+            build_stock_table(df_products, df_sales, period_days) if has_dates else None
+        )
 
-        # Считаем период от последнего дня, за который есть данные: Ozon может
-        # отдавать статистику с задержкой, и «последние 30 дней от сегодня»
-        # оказались бы короче на день-два.
-        sales_end = sales["day"].max()
-        if pd.isna(sales_end):
-            st.info("В статистике продаж нет корректных дат. Обновите данные.")
-            recent = sales.iloc[0:0]
+        if analysis is None:
+            if has_dates:
+                st.info("За выбранный период продаж нет. Обновите статистику.")
+            else:
+                st.info("В статистике продаж нет корректных дат. Обновите данные.")
         else:
-            period_start = sales_end - pd.Timedelta(days=period_days - 1)
-            recent = sales[(sales["day"] >= period_start) & (sales["day"] <= sales_end)]
+            stock = analysis.stock
+            recent = analysis.recent
             st.caption(
-                f"Период: {period_start.strftime('%d.%m.%Y')} — "
-                f"{sales_end.strftime('%d.%m.%Y')}"
+                f"Период: {analysis.period_start.strftime('%d.%m.%Y')} — "
+                f"{analysis.period_end.strftime('%d.%m.%Y')}"
             )
-
-        if recent.empty:
-            st.info("За выбранный период продаж нет. Обновите статистику.")
-        else:
-            observed_days = int((recent["day"].max() - recent["day"].min()).days) + 1
-            divisor = max(1, min(period_days, observed_days))
-
-            agg = recent.groupby("sku", as_index=False).agg(
-                sold=("ordered_units", "sum"),
-                revenue=("revenue", "sum"),
-            )
-            agg["avg_daily"] = [average_daily_sales(u, divisor) for u in agg["sold"]]
-
-            stock = df_products[
-                ["sku", "name", "price", "quantity_fbo", "quantity_fbs"]
-            ].copy()
-            stock["price"] = pd.to_numeric(stock["price"], errors="coerce").fillna(0)
-            stock["quantity_fbo"] = pd.to_numeric(
-                stock["quantity_fbo"], errors="coerce"
-            ).fillna(0)
-            stock["quantity_fbs"] = pd.to_numeric(
-                stock["quantity_fbs"], errors="coerce"
-            ).fillna(0)
-            stock["stock_total"] = stock["quantity_fbo"] + stock["quantity_fbs"]
-            stock = stock.merge(agg, on="sku", how="left")
-            stock[["sold", "revenue", "avg_daily"]] = stock[
-                ["sold", "revenue", "avg_daily"]
-            ].fillna(0)
-
-            stock["days_left"] = [
-                days_of_stock(s, a)
-                for s, a in zip(stock["stock_total"], stock["avg_daily"])
-            ]
-            stock["status"] = [
-                stock_status(d, s)
-                for d, s in zip(stock["days_left"], stock["stock_total"])
-            ]
-            stock["status_label"] = stock["status"].map(STOCK_STATUS_LABELS)
-            stock["days_left_display"] = [
-                "—" if pd.isna(d) else f"{d:.1f}" for d in stock["days_left"]
-            ]
 
             critical_count = int(stock["status"].isin(["out", "critical"]).sum())
             col_sold, col_revenue, col_attention = st.columns(3)
             col_sold.metric("Заказано за период", f"{int(stock['sold'].sum())} шт.")
             col_revenue.metric("Выручка за период", f"{stock['revenue'].sum():,.2f} руб.")
             col_attention.metric("Требуют внимания", f"{critical_count} SKU")
-
-            stock["_sort_days"] = [
-                float("inf") if pd.isna(d) else d for d in stock["days_left"]
-            ]
-            stock = stock.sort_values("_sort_days").drop(columns="_sort_days")
 
             stock_display = stock.rename(
                 columns={
@@ -510,15 +484,15 @@ if not df_products.empty:
             ]
             st.dataframe(stock_display, width="stretch", hide_index=True)
 
-            unmatched = set(recent["sku"]) - set(df_products["sku"])
+            unmatched = analysis.unmatched_skus
             if unmatched:
                 st.caption(
                     f"ℹ️ В статистике есть {len(unmatched)} SKU, которых нет в списке "
                     "товаров (возможно, архивные) — они не участвуют в расчёте."
                 )
 
-            last_sales_sync = pd.to_datetime(df_sales["synced_at"], errors="coerce").max()
-            if pd.notna(last_sales_sync):
+            last_sales_sync = analysis.last_sales_sync
+            if last_sales_sync is not None:
                 st.caption(
                     f"Статистика продаж обновлена: {last_sales_sync.strftime('%d.%m.%Y %H:%M')}"
                 )
@@ -541,9 +515,6 @@ if not df_products.empty:
 
             # --- ЗАВИСШИЕ И МЕДЛЕННЫЕ ТОВАРЫ ---
             st.subheader("Зависшие и медленные товары")
-            stock["is_stale"] = [
-                is_stale(s, a) for s, a in zip(stock["stock_total"], stock["avg_daily"])
-            ]
             stale = stock[stock["is_stale"]].copy()
 
             if stale.empty:
@@ -668,6 +639,175 @@ if not df_products.empty:
                     width="stretch",
                     hide_index=True,
                 )
+
+# --- ЖУРНАЛ РЕКОМЕНДАЦИЙ ---
+st.subheader("Журнал рекомендаций")
+st.caption(
+    "Что предложили → что сделали → какой результат. "
+    "Записи можно дополнять по мере работы с товаром."
+)
+
+df_recommendations = load_recommendations()
+
+if not df_recommendations.empty:
+    open_count = int(
+        df_recommendations["status"].isin(OPEN_RECOMMENDATION_STATUSES).sum()
+    )
+    done_count = int((df_recommendations["status"] == "done").sum())
+    rejected_count = int((df_recommendations["status"] == "rejected").sum())
+
+    col_total, col_open, col_done, col_rejected = st.columns(4)
+    col_total.metric("Всего записей", len(df_recommendations))
+    col_open.metric("В работе", open_count)
+    col_done.metric("Выполнено", done_count)
+    col_rejected.metric("Отклонено", rejected_count)
+
+    journal = df_recommendations.copy()
+    journal["status_label"] = journal["status"].map(RECOMMENDATION_STATUS_LABELS)
+    journal["kind_label"] = journal["kind"].map(RECOMMENDATION_KIND_LABELS)
+    journal["kind_label"] = journal["kind_label"].fillna(journal["kind"])
+    journal["created_at"] = pd.to_datetime(
+        journal["created_at"], errors="coerce"
+    ).dt.strftime("%d.%m.%Y")
+
+    edited_journal = st.data_editor(
+        journal[
+            [
+                "id",
+                "sku",
+                "kind_label",
+                "problem",
+                "action",
+                "result",
+                "status_label",
+                "created_at",
+            ]
+        ],
+        hide_index=True,
+        width="stretch",
+        key="recommendations_editor",
+        column_config={
+            "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+            "sku": st.column_config.TextColumn("SKU", disabled=True),
+            "kind_label": st.column_config.TextColumn("Тип", disabled=True),
+            "problem": st.column_config.TextColumn(
+                "Что предложили", disabled=True, width="large"
+            ),
+            "action": st.column_config.TextColumn("Что сделали", width="large"),
+            "result": st.column_config.TextColumn("Результат", width="large"),
+            "status_label": st.column_config.SelectboxColumn(
+                "Статус",
+                options=list(RECOMMENDATION_STATUS_LABELS.values()),
+                required=True,
+            ),
+            "created_at": st.column_config.TextColumn("Создано", disabled=True),
+        },
+    )
+
+    if st.button("💾 Сохранить журнал", key="recommendations_save"):
+        try:
+            for row in edited_journal.itertuples(index=False):
+                update_recommendation(
+                    int(row.id),
+                    cell_text(row.action),
+                    cell_text(row.result),
+                    STATUS_BY_LABEL.get(row.status_label, "new"),
+                )
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            st.success("Журнал сохранён.")
+            st.rerun()
+
+    with st.expander("Удалить запись"):
+        rec_id = st.selectbox(
+            "Запись",
+            df_recommendations["id"].tolist(),
+            format_func=lambda i: (
+                f"#{i} — "
+                f"{str(df_recommendations.loc[df_recommendations['id'] == i, 'problem'].iloc[0])[:70]}"
+            ),
+            key="delete_recommendation_id",
+        )
+        if st.button("🗑 Удалить", key="delete_recommendation_btn"):
+            delete_recommendation(rec_id)
+            st.rerun()
+else:
+    st.info("Записей пока нет — добавьте первую ниже.")
+
+if not df_products.empty:
+    st.markdown("**🤖 Подсказки по текущим остаткам**")
+    if df_sales.empty:
+        st.caption("Появятся после загрузки статистики продаж.")
+    else:
+        analysis_for_recs = build_stock_table(df_products, df_sales, 30)
+        if analysis_for_recs is None:
+            st.caption("Недостаточно данных о продажах за последние 30 дней.")
+        else:
+            suggestions = build_stock_recommendations(
+                analysis_for_recs.stock.to_dict("records")
+            )
+            if not suggestions:
+                st.caption("Актуальных проблем не найдено.")
+            else:
+                st.caption(
+                    f"Найдено подсказок: {len(suggestions)}. Уже открытые "
+                    "по тому же SKU и типу не дублируются."
+                )
+                if st.button(
+                    "🤖 Добавить подсказки в журнал", key="recommendations_suggest"
+                ):
+                    added = add_recommendations(suggestions)
+                    if added:
+                        st.success(f"Добавлено записей: {added}.")
+                        st.rerun()
+                    else:
+                        st.info("Все актуальные подсказки уже есть в журнале.")
+
+with st.form("recommendation_form", clear_on_submit=True):
+    st.markdown("**Добавить рекомендацию вручную**")
+    name_by_sku = (
+        dict(zip(df_products["sku"].astype(str), df_products["name"]))
+        if not df_products.empty
+        else {}
+    )
+    if df_products.empty:
+        rec_sku = ""
+        st.caption("Товары не загружены — запись будет без привязки к SKU.")
+    else:
+        rec_sku = st.selectbox(
+            "Товар (необязательно)",
+            [""] + df_products["sku"].astype(str).tolist(),
+            format_func=lambda s: (
+                "— без привязки —"
+                if not s
+                else f"{s} — {name_by_sku.get(s, 'Без названия')}"
+            ),
+            key="recommendation_sku",
+        )
+
+    rec_problem = st.text_area("Что предложили")
+    rec_action = st.text_input("Что сделали (можно позже)")
+    rec_result = st.text_input("Результат (можно позже)")
+    rec_status_label = st.selectbox(
+        "Статус",
+        list(RECOMMENDATION_STATUS_LABELS.values()),
+        key="recommendation_status",
+    )
+    rec_submitted = st.form_submit_button("💾 Добавить рекомендацию")
+    if rec_submitted:
+        if not rec_problem.strip():
+            st.warning("Опишите, что предложили.")
+        else:
+            add_recommendation(
+                rec_sku,
+                rec_problem.strip(),
+                action=rec_action.strip(),
+                result=rec_result.strip(),
+                status=STATUS_BY_LABEL[rec_status_label],
+            )
+            st.success("Рекомендация добавлена.")
+            st.rerun()
 
 # --- ДОКУМЕНТЫ ---
 st.subheader("Документы и сроки действия")

@@ -36,7 +36,7 @@ def test_init_db_creates_all_tables(db):
     finally:
         conn.close()
 
-    assert {"products", "sync_log", "documents"} <= tables
+    assert {"products", "sync_log", "documents", "recommendations"} <= tables
 
 
 def test_save_products_inserts_data_and_sync_log(db):
@@ -176,3 +176,64 @@ def test_documents_add_and_delete(db):
 
     db.delete_document(doc["id"])
     assert fetch_one(db, "SELECT * FROM documents") is None
+
+
+def test_add_recommendation_and_update_status(db):
+    rec_id = db.add_recommendation("111", "Поднять цену на 5%")
+
+    row = fetch_one(db, "SELECT * FROM recommendations WHERE id = ?", (rec_id,))
+    assert row["sku"] == "111"
+    assert row["kind"] == "manual"
+    assert row["problem"] == "Поднять цену на 5%"
+    assert row["status"] == "new"
+    assert row["action"] == ""
+    assert row["result"] == ""
+
+    updated = db.update_recommendation(
+        rec_id, action="Подняли цену", result="Маржа +3 п.п.", status="done"
+    )
+    assert updated == 1
+
+    row = fetch_one(db, "SELECT * FROM recommendations WHERE id = ?", (rec_id,))
+    assert row["action"] == "Подняли цену"
+    assert row["result"] == "Маржа +3 п.п."
+    assert row["status"] == "done"
+    assert row["updated_at"] >= row["created_at"]
+
+
+def test_add_recommendation_rejects_empty_problem_and_unknown_status(db):
+    with pytest.raises(ValueError):
+        db.add_recommendation("111", "   ")
+    with pytest.raises(ValueError):
+        db.add_recommendation("111", "Нормальная идея", status="unknown")
+
+
+def test_add_recommendations_skips_open_duplicates(db):
+    items = [
+        {"sku": "111", "kind": "low_stock", "problem": "Мало остатка"},
+        {"sku": "111", "kind": "low_stock", "problem": "Мало остатка (повтор)"},
+        {"sku": "222", "kind": "stale_stock", "problem": "Зависший остаток"},
+    ]
+
+    assert db.add_recommendations(items) == 2
+    assert fetch_one(db, "SELECT COUNT(*) FROM recommendations")[0] == 2
+
+    # Пока запись открыта, повторно она не добавляется
+    assert db.add_recommendations(items) == 0
+
+    rec = fetch_one(
+        db,
+        "SELECT id FROM recommendations WHERE sku='111' AND kind='low_stock'",
+    )
+    db.update_recommendation(rec["id"], status="done")
+
+    # После закрытия проблемы подсказка может появиться снова
+    assert db.add_recommendations(items) == 1
+
+
+def test_delete_recommendation(db):
+    rec_id = db.add_recommendation("111", "Проверить карточку")
+
+    db.delete_recommendation(rec_id)
+
+    assert fetch_one(db, "SELECT * FROM recommendations") is None

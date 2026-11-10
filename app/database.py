@@ -3,6 +3,10 @@ import os
 from datetime import datetime
 
 from app.economics import UnitEconomics
+from app.recommendations import (
+    OPEN_RECOMMENDATION_STATUSES,
+    RECOMMENDATION_STATUSES,
+)
 
 # Путь к базе можно переопределить переменной окружения — это нужно тестам,
 # чтобы они не трогали реальные данные.
@@ -112,6 +116,21 @@ def init_db():
         quantity_fbs INTEGER DEFAULT 0,
         synced_at TEXT,
         PRIMARY KEY (sku, snapshot_date)
+    )
+    """)
+
+    # Журнал рекомендаций: что предложили, что сделали, какой результат
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS recommendations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sku TEXT,
+        kind TEXT DEFAULT 'manual',
+        problem TEXT NOT NULL,
+        action TEXT DEFAULT '',
+        result TEXT DEFAULT '',
+        status TEXT DEFAULT 'new',
+        created_at TEXT,
+        updated_at TEXT
     )
     """)
 
@@ -354,6 +373,134 @@ def delete_document(doc_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+
+
+def _validate_recommendation_status(status: str) -> str:
+    if status not in RECOMMENDATION_STATUSES:
+        raise ValueError(f"Неизвестный статус рекомендации: {status!r}")
+    return status
+
+
+def add_recommendation(
+    sku: str,
+    problem: str,
+    kind: str = "manual",
+    action: str = "",
+    result: str = "",
+    status: str = "new",
+) -> int:
+    """Добавляет запись в журнал рекомендаций. Возвращает id записи."""
+    problem = (problem or "").strip()
+    if not problem:
+        raise ValueError("Рекомендация не может быть пустой")
+    _validate_recommendation_status(status)
+
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO recommendations (
+            sku, kind, problem, action, result, status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (sku or "").strip(),
+            (kind or "manual").strip(),
+            problem,
+            (action or "").strip(),
+            (result or "").strip(),
+            status,
+            now,
+            now,
+        ),
+    )
+    rec_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return rec_id
+
+
+def add_recommendations(items: list) -> int:
+    """Добавляет пачку рекомендаций, пропуская уже открытые по тому же SKU и типу.
+
+    Возвращает число добавленных записей.
+    """
+    now = datetime.now().isoformat()
+    inserted = 0
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    for item in items:
+        problem = str(item.get("problem") or "").strip()
+        if not problem:
+            continue
+        sku = str(item.get("sku") or "").strip()
+        kind = str(item.get("kind") or "manual").strip()
+        exists = cursor.execute(
+            """
+            SELECT 1 FROM recommendations
+            WHERE sku = ? AND kind = ? AND status IN (?, ?)
+            """,
+            (sku, kind, *OPEN_RECOMMENDATION_STATUSES),
+        ).fetchone()
+        if exists:
+            continue
+        cursor.execute(
+            """
+            INSERT INTO recommendations (
+                sku, kind, problem, action, result, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, '', '', 'new', ?, ?)
+            """,
+            (sku, kind, problem, now, now),
+        )
+        inserted += 1
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def update_recommendation(
+    rec_id: int,
+    action: str = "",
+    result: str = "",
+    status: str = "new",
+) -> int:
+    """Обновляет действие, результат и статус записи. Возвращает число строк."""
+    _validate_recommendation_status(status)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE recommendations SET
+            action = ?,
+            result = ?,
+            status = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            (action or "").strip(),
+            (result or "").strip(),
+            status,
+            datetime.now().isoformat(),
+            rec_id,
+        ),
+    )
+    updated = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def delete_recommendation(rec_id: int):
+    """Удаляет запись журнала рекомендаций по id"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM recommendations WHERE id = ?", (rec_id,))
     conn.commit()
     conn.close()
 

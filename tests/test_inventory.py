@@ -4,6 +4,7 @@ from app.inventory import (
     STOCK_STATUS_LABELS,
     average_daily_sales,
     days_of_stock,
+    is_stale,
     stock_status,
 )
 
@@ -48,3 +49,17 @@ def test_stock_status(days_left, stock, expected):
 def test_every_status_has_a_label():
     for status in {"out", "critical", "warning", "ok", "no_sales"}:
         assert status in STOCK_STATUS_LABELS
+
+
+@pytest.mark.parametrize(
+    ("stock", "avg_daily", "expected"),
+    [
+        (0, 0, False),
+        (100, 0, True),
+        (100, 10, False),
+        (300, 10, False),
+        (301, 10, True),
+    ],
+)
+def test_is_stale(stock, avg_daily, expected):
+    assert is_stale(stock, avg_daily) is expected

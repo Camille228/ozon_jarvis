@@ -7,6 +7,8 @@ from app.economics import to_float
 # Пороги в днях: ниже 7 — критично, 7–14 — предупреждение, больше 14 — норма
 LOW_STOCK_DAYS = 7.0
 WARNING_STOCK_DAYS = 14.0
+# Запас больше чем на 30 дней считаем медленным/зависшим
+STALE_STOCK_DAYS = 30.0
 
 STOCK_STATUS_LABELS = {
     "out": "🔴 нет в наличии",
@@ -51,3 +53,13 @@ def stock_status(days_left, stock=0) -> str:
     if days_left < WARNING_STOCK_DAYS:
         return "warning"
     return "ok"
+
+
+def is_stale(stock, avg_daily_sales_value, threshold_days=STALE_STOCK_DAYS) -> bool:
+    """Товар зависший/медленный: остаток есть, а продаж нет или запаса > 30 дней."""
+    if to_float(stock) <= 0:
+        return False
+    coverage = days_of_stock(stock, avg_daily_sales_value)
+    if coverage is None:
+        return True
+    return coverage > to_float(threshold_days)

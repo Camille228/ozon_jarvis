@@ -18,9 +18,11 @@ from app.database import (
 )
 from app.economics import UnitEconomics, to_float
 from app.inventory import (
+    STALE_STOCK_DAYS,
     STOCK_STATUS_LABELS,
     average_daily_sales,
     days_of_stock,
+    is_stale,
     stock_status,
 )
 from app.ozon_client import OzonApiError, get_products, get_sales
@@ -51,6 +53,18 @@ def load_sales() -> pd.DataFrame:
             return pd.read_sql_query("SELECT * FROM sales_daily", conn)
     except sqlite3.Error as e:
         st.error(f"Не удалось прочитать статистику продаж: {e}")
+        return pd.DataFrame()
+
+
+def load_stock_snapshots() -> pd.DataFrame:
+    """Читает историю срезов остатков."""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM stock_snapshots ORDER BY snapshot_date", conn
+            )
+    except sqlite3.Error as e:
+        st.error(f"Не удалось прочитать историю остатков: {e}")
         return pd.DataFrame()
 
 
@@ -412,7 +426,10 @@ if not df_products.empty:
             )
             agg["avg_daily"] = [average_daily_sales(u, divisor) for u in agg["sold"]]
 
-            stock = df_products[["sku", "name", "quantity_fbo", "quantity_fbs"]].copy()
+            stock = df_products[
+                ["sku", "name", "price", "quantity_fbo", "quantity_fbs"]
+            ].copy()
+            stock["price"] = pd.to_numeric(stock["price"], errors="coerce").fillna(0)
             stock["quantity_fbo"] = pd.to_numeric(
                 stock["quantity_fbo"], errors="coerce"
             ).fillna(0)
@@ -506,6 +523,136 @@ if not df_products.empty:
                     hide_index=True,
                 )
                 st.bar_chart(recent.groupby("day")["ordered_units"].sum())
+
+            # --- ЗАВИСШИЕ И МЕДЛЕННЫЕ ТОВАРЫ ---
+            st.subheader("Зависшие и медленные товары")
+            stock["is_stale"] = [
+                is_stale(s, a) for s, a in zip(stock["stock_total"], stock["avg_daily"])
+            ]
+            stale = stock[stock["is_stale"]].copy()
+
+            if stale.empty:
+                st.success("Нет товаров, запаса которых хватает больше чем на 30 дней.")
+            else:
+                stale["frozen_value"] = stale["stock_total"] * stale["price"]
+                stale["stale_reason"] = [
+                    "🔴 нет продаж" if a <= 0 else "🟠 > 30 дн."
+                    for a in stale["avg_daily"]
+                ]
+                stale["_sort_stale"] = [
+                    float("inf") if pd.isna(d) else d for d in stale["days_left"]
+                ]
+                stale = stale.sort_values(
+                    ["_sort_stale", "stock_total"], ascending=[False, False]
+                )
+
+                col_stale, col_frozen, col_frozen_value = st.columns(3)
+                col_stale.metric("Зависших/медленных", f"{len(stale)} SKU")
+                col_frozen.metric("Заморожено", f"{int(stale['stock_total'].sum())} шт.")
+                col_frozen_value.metric(
+                    "По цене продажи", f"{stale['frozen_value'].sum():,.2f} руб."
+                )
+
+                stale_display = stale.rename(
+                    columns={
+                        "sku": "SKU",
+                        "name": "Название",
+                        "stock_total": "Остаток",
+                        "sold": f"Заказано за {period_days} дн.",
+                        "days_left_display": "Хватит, дн.",
+                        "frozen_value": "По цене, руб.",
+                        "stale_reason": "Причина",
+                    }
+                )[
+                    [
+                        "SKU",
+                        "Название",
+                        "Остаток",
+                        f"Заказано за {period_days} дн.",
+                        "Хватит, дн.",
+                        "По цене, руб.",
+                        "Причина",
+                    ]
+                ]
+                st.dataframe(stale_display, width="stretch", hide_index=True)
+                st.caption(
+                    "Зависшими считаются товары с остатком, которого хватает больше чем "
+                    f"на {int(STALE_STOCK_DAYS)} дней, или товары без продаж за период. "
+                    "Оценка по текущей скорости продаж; история остатков накапливается "
+                    "с каждой синхронизацией товаров."
+                )
+
+# --- ИСТОРИЯ ОСТАТКОВ ---
+if not df_products.empty:
+    st.subheader("История остатков")
+    df_snapshots = load_stock_snapshots()
+
+    if df_snapshots.empty:
+        st.info("История появится после синхронизации товаров.")
+    else:
+        snapshots = df_snapshots.copy()
+        snapshots["snapshot_date"] = pd.to_datetime(
+            snapshots["snapshot_date"], errors="coerce"
+        )
+        snapshots["quantity_fbo"] = pd.to_numeric(
+            snapshots["quantity_fbo"], errors="coerce"
+        ).fillna(0)
+        snapshots["quantity_fbs"] = pd.to_numeric(
+            snapshots["quantity_fbs"], errors="coerce"
+        ).fillna(0)
+        snapshots["total"] = snapshots["quantity_fbo"] + snapshots["quantity_fbs"]
+        snapshots = snapshots.dropna(subset=["snapshot_date"])
+
+        if snapshots.empty:
+            st.info("В истории остатков нет корректных дат.")
+        else:
+            first_day = snapshots["snapshot_date"].min()
+            last_day = snapshots["snapshot_date"].max()
+            days_observed = (last_day - first_day).days + 1
+            st.caption(
+                f"Срезов: {snapshots['snapshot_date'].nunique()} за {days_observed} дн. "
+                f"({first_day.strftime('%d.%m.%Y')} — {last_day.strftime('%d.%m.%Y')})."
+            )
+
+            history_names = dict(zip(df_products["sku"], df_products["name"]))
+            history_sku = st.selectbox(
+                "Товар для графика",
+                df_products["sku"].tolist(),
+                format_func=lambda s: f"{s} — {history_names.get(s, 'Без названия')}",
+                key="stock_history_sku",
+            )
+            sku_history = snapshots[snapshots["sku"] == history_sku].sort_values(
+                "snapshot_date"
+            )
+
+            if sku_history.empty:
+                st.info("По этому товару срезов пока нет.")
+            else:
+                if sku_history["snapshot_date"].nunique() < 2:
+                    st.info(
+                        "Пока только один срез — график появится после следующей "
+                        "синхронизации товаров."
+                    )
+                else:
+                    st.line_chart(
+                        sku_history.set_index("snapshot_date")[["total"]].rename(
+                            columns={"total": "Остаток"}
+                        )
+                    )
+                st.dataframe(
+                    sku_history[
+                        ["snapshot_date", "quantity_fbo", "quantity_fbs", "total"]
+                    ].rename(
+                        columns={
+                            "snapshot_date": "Дата",
+                            "quantity_fbo": "FBO",
+                            "quantity_fbs": "FBS",
+                            "total": "Всего",
+                        }
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 # --- ДОКУМЕНТЫ ---
 st.subheader("Документы и сроки действия")

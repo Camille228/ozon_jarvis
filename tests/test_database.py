@@ -57,6 +57,40 @@ def test_save_products_inserts_data_and_sync_log(db):
     assert "Загружено товаров: 1" in log["message"]
 
 
+def test_save_products_creates_daily_stock_snapshot(db):
+    db.save_products([sample_product()])
+
+    snapshot = fetch_one(db, "SELECT * FROM stock_snapshots WHERE sku='111'")
+    assert snapshot["snapshot_date"] == "2026-11-10"
+    assert snapshot["quantity_fbo"] == 5
+    assert snapshot["quantity_fbs"] == 2
+
+    updated = sample_product()
+    updated["quantity_fbo"] = 7
+    db.save_products([updated])
+
+    assert fetch_one(db, "SELECT COUNT(*) FROM stock_snapshots")[0] == 1
+    assert (
+        fetch_one(db, "SELECT quantity_fbo FROM stock_snapshots WHERE sku='111'")[0]
+        == 7
+    )
+
+
+def test_init_db_backfills_stock_snapshot_once(db):
+    db.save_products([sample_product()])
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        conn.execute("DELETE FROM stock_snapshots")
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db()
+    db.init_db()
+
+    assert fetch_one(db, "SELECT COUNT(*) FROM stock_snapshots")[0] == 1
+
+
 def test_save_products_preserves_manual_economics(db):
     db.save_products([sample_product()])
     db.update_product_economics("111", 300.0, 20.0, 50.0, 30.0, 10.0)

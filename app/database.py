@@ -102,6 +102,35 @@ def init_db():
         PRIMARY KEY (sku, day)
     )
     """)
+
+    # Дневные срезы остатков: история для поиска зависших товаров
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS stock_snapshots (
+        sku TEXT NOT NULL,
+        snapshot_date TEXT NOT NULL,
+        quantity_fbo INTEGER DEFAULT 0,
+        quantity_fbs INTEGER DEFAULT 0,
+        synced_at TEXT,
+        PRIMARY KEY (sku, snapshot_date)
+    )
+    """)
+
+    # Первый срез из уже загруженных товаров, чтобы история не начиналась с нуля
+    cursor.execute("SELECT COUNT(*) FROM stock_snapshots")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("""
+            INSERT INTO stock_snapshots (
+                sku, snapshot_date, quantity_fbo, quantity_fbs, synced_at
+            )
+            SELECT
+                sku,
+                COALESCE(substr(ozon_updated_at, 1, 10), date('now')),
+                quantity_fbo,
+                quantity_fbs,
+                datetime('now')
+            FROM products
+        """)
+
     conn.commit()
     conn.close()
 
@@ -149,6 +178,32 @@ def save_products(items: list):
             commission_default if commission_default is not None else 0,
             item.get("ozon_updated_at") or now, now,
         ))
+
+    # Дневной срез остатков: обновляем срез за тот же день, а не дублируем
+    snapshot_rows = []
+    for item in items:
+        snapshot_date = str(item.get("ozon_updated_at") or now)[:10]
+        snapshot_rows.append((
+            str(item["sku"]),
+            snapshot_date,
+            int(item.get("quantity_fbo") or 0),
+            int(item.get("quantity_fbs") or 0),
+            now,
+        ))
+    if snapshot_rows:
+        cursor.executemany(
+            """
+            INSERT INTO stock_snapshots (
+                sku, snapshot_date, quantity_fbo, quantity_fbs, synced_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(sku, snapshot_date) DO UPDATE SET
+                quantity_fbo = excluded.quantity_fbo,
+                quantity_fbs = excluded.quantity_fbs,
+                synced_at = excluded.synced_at
+            """,
+            snapshot_rows,
+        )
 
     # Записываем в журнал
     cursor.execute(

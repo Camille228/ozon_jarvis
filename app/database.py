@@ -1,12 +1,18 @@
 import sqlite3
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
-DB_PATH = "data/jarvis.db"
+from app.economics import UnitEconomics
+
+# Путь к базе можно переопределить переменной окружения — это нужно тестам,
+# чтобы они не трогали реальные данные.
+DB_PATH = os.environ.get("JARVIS_DB_PATH", "data/jarvis.db")
 
 def init_db():
     """Создает базу данных и таблицы, если их еще нет"""
-    os.makedirs("data", exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -192,6 +198,33 @@ def update_product_economics(
     conn.commit()
     conn.close()
 
+def update_costs_bulk(costs: dict) -> int:
+    """Массово обновляет себестоимость товаров.
+
+    costs — словарь {sku: себестоимость}. Возвращает число обновленных строк.
+    Отрицательная или нечисловая себестоимость не записывается: это ошибка ввода.
+    """
+    prepared = []
+    for sku, cost in costs.items():
+        try:
+            value = float(cost)
+        except (TypeError, ValueError):
+            raise ValueError(f"Некорректная себестоимость для SKU {sku}: {cost!r}")
+        if value < 0:
+            raise ValueError(f"Себестоимость не может быть отрицательной: SKU {sku}")
+        prepared.append((value, str(sku)))
+
+    if not prepared:
+        return 0
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.executemany("UPDATE products SET cost_price = ? WHERE sku = ?", prepared)
+    updated = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated
+
 def add_document(title: str, doc_type: str, sku: str, expires_at: str, notes: str = ""):
     """Добавляет документ со сроком действия"""
     conn = sqlite3.connect(DB_PATH)
@@ -226,20 +259,19 @@ def show_products():
     print("\n--- ТОВАРЫ В БАЗЕ ---")
     for row in rows:
         row = dict(row)
-        price = row.get("price") or 0
-        cost = row.get("cost_price") or 0
-        commission = price * (row.get("commission_rate") or 0) / 100
-        other_costs = (
-            (row.get("logistics_cost") or 0)
-            + (row.get("last_mile_cost") or 0)
-            + (row.get("packaging_cost") or 0)
+        econ = UnitEconomics.build(
+            price=row.get("price"),
+            cost_price=row.get("cost_price"),
+            commission_rate=row.get("commission_rate"),
+            logistics_cost=row.get("logistics_cost"),
+            last_mile_cost=row.get("last_mile_cost"),
+            packaging_cost=row.get("packaging_cost"),
         )
-        profit = price - cost - commission - other_costs
         print(
             f"SKU: {row['sku']} | Артикул: {row.get('offer_id') or '-'} | {row.get('name')} | "
-            f"Цена: {price} руб. | Остатки FBO/FBS: {row.get('quantity_fbo') or 0}/"
+            f"Цена: {econ.price} руб. | Остатки FBO/FBS: {row.get('quantity_fbo') or 0}/"
             f"{row.get('quantity_fbs') or 0} | "
-            f"Себестоимость: {cost} руб. | Комиссия: {commission} руб. | "
-            f"Прибыль: {profit} руб. | Данные Ozon от: {row.get('ozon_updated_at') or '-'}"
+            f"Себестоимость: {econ.cost_price} руб. | Комиссия: {econ.commission} руб. | "
+            f"Прибыль: {econ.profit} руб. | Данные Ozon от: {row.get('ozon_updated_at') or '-'}"
         )
     print("---------------------\n")

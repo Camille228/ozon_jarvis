@@ -1,0 +1,113 @@
+import sqlite3
+
+import pytest
+
+
+def sample_product(sku="111", price=1000.0):
+    return {
+        "sku": sku,
+        "offer_id": f"offer-{sku}",
+        "name": f"Товар {sku}",
+        "price": price,
+        "quantity_fbo": 5,
+        "quantity_fbs": 2,
+        "commission_rate_ozon_fbo": 23.0,
+        "commission_rate_ozon_fbs": 24.0,
+        "ozon_updated_at": "2026-11-10T10:00:00",
+    }
+
+
+def fetch_one(db, query, params=()):
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(query, params).fetchone()
+    finally:
+        conn.close()
+
+
+def test_init_db_creates_all_tables(db):
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+
+    assert {"products", "sync_log", "documents"} <= tables
+
+
+def test_save_products_inserts_data_and_sync_log(db):
+    db.save_products([sample_product()])
+
+    row = fetch_one(db, "SELECT * FROM products WHERE sku='111'")
+    assert row["name"] == "Товар 111"
+    assert row["price"] == 1000.0
+    assert row["quantity_fbo"] == 5
+    assert row["quantity_fbs"] == 2
+    assert row["commission_rate_ozon_fbo"] == 23.0
+    assert row["commission_rate_ozon_fbs"] == 24.0
+    # Новичку стартовая комиссия берется из FBS
+    assert row["commission_rate"] == 24.0
+
+    log = fetch_one(db, "SELECT * FROM sync_log ORDER BY id DESC LIMIT 1")
+    assert log["status"] == "success"
+    assert "Загружено товаров: 1" in log["message"]
+
+
+def test_save_products_preserves_manual_economics(db):
+    db.save_products([sample_product()])
+    db.update_product_economics("111", 300.0, 20.0, 50.0, 30.0, 10.0)
+
+    db.save_products([sample_product(price=1200.0)])
+
+    row = fetch_one(db, "SELECT * FROM products WHERE sku='111'")
+    assert row["price"] == 1200.0  # данные Ozon обновились
+    assert row["cost_price"] == 300.0  # ручная экономика не затёрлась
+    assert row["commission_rate"] == 20.0
+    assert row["logistics_cost"] == 50.0
+
+
+def test_update_costs_bulk_updates_every_sku(db):
+    db.save_products([sample_product("111"), sample_product("222")])
+
+    updated = db.update_costs_bulk({"111": 100.0, "222": "250.5"})
+
+    assert updated == 2
+    assert fetch_one(db, "SELECT cost_price FROM products WHERE sku='111'")[0] == 100.0
+    assert fetch_one(db, "SELECT cost_price FROM products WHERE sku='222'")[0] == 250.5
+
+
+def test_update_costs_bulk_rejects_negative_and_invalid_values(db):
+    db.save_products([sample_product()])
+
+    with pytest.raises(ValueError):
+        db.update_costs_bulk({"111": -1})
+    with pytest.raises(ValueError):
+        db.update_costs_bulk({"111": "abc"})
+
+    assert fetch_one(db, "SELECT cost_price FROM products WHERE sku='111'")[0] == 0.0
+
+
+def test_update_costs_bulk_with_empty_dict_does_nothing(db):
+    assert db.update_costs_bulk({}) == 0
+
+
+def test_log_sync_writes_error(db):
+    db.log_sync("OZON_API", "error", "Ключи не заданы")
+
+    log = fetch_one(db, "SELECT * FROM sync_log ORDER BY id DESC LIMIT 1")
+    assert log["status"] == "error"
+    assert log["message"] == "Ключи не заданы"
+
+
+def test_documents_add_and_delete(db):
+    db.add_document("Сертификат", "Сертификат", "111", "2026-12-01", "важно")
+    doc = fetch_one(db, "SELECT * FROM documents")
+    assert doc["title"] == "Сертификат"
+    assert doc["sku"] == "111"
+
+    db.delete_document(doc["id"])
+    assert fetch_one(db, "SELECT * FROM documents") is None

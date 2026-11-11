@@ -39,7 +39,7 @@ from app.recommendations import (
 )
 from app.scheduler import create_background_scheduler, interval_hours_from_env
 from app.stock_analysis import build_stock_table
-from app.sync import sync_products, sync_sales
+from app.sync import SyncInProgressError, sync_products, sync_sales
 from app.tax import (
     OBJECT_INCOME_EXPENSE,
     OBJECT_LABELS,
@@ -234,6 +234,9 @@ with col_sync_products:
         with st.spinner("Стучимся в Ozon и обновляем базу..."):
             try:
                 count = sync_products()
+            except SyncInProgressError as e:
+                log_sync("OZON_API", "warning", str(e))
+                st.warning(str(e))
             except OzonApiError as e:
                 log_sync("OZON_API", "error", str(e))
                 st.error(f"Синхронизация не удалась: {e}")
@@ -251,6 +254,9 @@ with col_sync_sales:
         with st.spinner("Запрашиваем статистику продаж в Ozon..."):
             try:
                 count = sync_sales(30)
+            except SyncInProgressError as e:
+                log_sync("OZON_ANALYTICS", "warning", str(e))
+                st.warning(str(e))
             except OzonApiError as e:
                 log_sync("OZON_ANALYTICS", "error", str(e))
                 st.error(f"Не удалось загрузить продажи: {e}")

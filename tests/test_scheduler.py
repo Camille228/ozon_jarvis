@@ -2,6 +2,7 @@ import pytest
 
 from app import scheduler
 from app.ozon_client import OzonApiError
+from app.sync import SyncInProgressError
 
 
 @pytest.mark.parametrize(
@@ -58,6 +59,35 @@ def test_run_sync_writes_errors_to_journal(monkeypatch):
     assert len(result["errors"]) == 2
     assert [entry[0] for entry in logged] == ["OZON_API", "OZON_ANALYTICS"]
     assert all(entry[1] == "error" for entry in logged)
+
+
+def test_run_sync_collision_with_manual_sync_is_warning(monkeypatch):
+    logged = []
+
+    def busy_sales(days=30):
+        raise SyncInProgressError(
+            "Синхронизация уже выполняется — дождитесь её завершения"
+        )
+
+    monkeypatch.setattr(scheduler, "init_db", lambda: None)
+    monkeypatch.setattr(scheduler, "sync_products", lambda: 5)
+    monkeypatch.setattr(scheduler, "sync_sales", busy_sales)
+    monkeypatch.setattr(
+        scheduler,
+        "log_sync",
+        lambda source, status, message: logged.append((source, status, message)),
+    )
+
+    result = scheduler.run_sync()
+
+    # Товары успели синхронизироваться, продажи столкнулись с ручным запуском
+    assert result["products"] == 5
+    assert result["sales"] == 0
+    assert len(result["errors"]) == 1
+    assert logged[0][0] == "OZON_ANALYTICS"
+    # Коллизия — не ошибка, а предупреждение: красный баннер не нужен
+    assert logged[0][1] == "warning"
+    assert "уже выполняется" in logged[0][2]
 
 
 def test_create_background_scheduler_uses_env_interval(monkeypatch):

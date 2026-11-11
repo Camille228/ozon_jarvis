@@ -9,18 +9,21 @@ from app.ozon_client import (
     OzonApiError,
     _extract_page,
     _extract_sku,
+    _min_request_interval_from_env,
     _paginate_offset,
     _parse_number,
     _parse_ozon_warehouse,
     _parse_sales_row,
     _parse_seller_warehouse,
     _request,
+    _retry_wait_seconds,
     _server_time,
     get_products,
     get_sales,
     get_seller_warehouses,
     search_ozon_warehouses,
 )
+from app import ozon_client
 
 
 @pytest.mark.parametrize(
@@ -98,6 +101,122 @@ def test_request_retries_temporary_errors(monkeypatch):
 
     assert response.status_code == 200
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, ozon_client.DEFAULT_MIN_REQUEST_INTERVAL_SECONDS),
+        ("", ozon_client.DEFAULT_MIN_REQUEST_INTERVAL_SECONDS),
+        ("abc", ozon_client.DEFAULT_MIN_REQUEST_INTERVAL_SECONDS),
+        ("-1", ozon_client.DEFAULT_MIN_REQUEST_INTERVAL_SECONDS),
+        ("0", 0.0),
+        ("0.5", 0.5),
+        ("3", 3.0),
+    ],
+)
+def test_min_request_interval_from_env(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("JARVIS_OZON_MIN_REQUEST_INTERVAL", raising=False)
+    else:
+        monkeypatch.setenv("JARVIS_OZON_MIN_REQUEST_INTERVAL", raw)
+
+    assert _min_request_interval_from_env() == expected
+
+
+def test_request_throttles_between_calls(monkeypatch):
+    sleeps = []
+
+    def handler(request):
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(ozon_client, "MIN_REQUEST_INTERVAL_SECONDS", 5.0)
+    monkeypatch.setattr(ozon_client, "_last_request_monotonic", None)
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    _request(client, "/v1/test", {})
+    _request(client, "/v1/test", {})
+
+    # Второй запрос ждет положенный интервал после первого
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(5.0, abs=1.0)
+
+
+def test_request_first_call_does_not_wait(monkeypatch):
+    sleeps = []
+
+    def handler(request):
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(ozon_client, "MIN_REQUEST_INTERVAL_SECONDS", 5.0)
+    monkeypatch.setattr(ozon_client, "_last_request_monotonic", None)
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    _request(client, "/v1/test", {})
+
+    assert sleeps == []
+
+
+def test_retry_wait_prefers_retry_after_header():
+    response = httpx.Response(429, headers={"Retry-After": "7"})
+
+    # Совет сервера важнее экспоненты (2 сек на первой попытке)
+    assert _retry_wait_seconds(response, 1) == 7.0
+
+
+def test_retry_wait_uses_exponent_without_header():
+    response = httpx.Response(429)
+
+    assert _retry_wait_seconds(response, 1) == 2.0
+    assert _retry_wait_seconds(response, 3) == 8.0
+
+
+def test_retry_wait_caps_header_value():
+    response = httpx.Response(429, headers={"Retry-After": "500"})
+
+    assert _retry_wait_seconds(response, 1) == ozon_client.MAX_RETRY_WAIT_SECONDS
+
+
+def test_retry_wait_ignores_bad_header():
+    response = httpx.Response(429, headers={"Retry-After": "not-a-number"})
+
+    assert _retry_wait_seconds(response, 1) == 2.0
+
+
+def test_request_honors_retry_after_header(monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            return httpx.Response(
+                429,
+                json={"message": "rate limit"},
+                headers={"Retry-After": "7"},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    sleeps = []
+    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: sleeps.append(s))
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    response = _request(client, "/v1/test", {})
+
+    assert response.status_code == 200
+    assert sleeps == [7.0]
+
+
+def test_request_rate_limit_error_explains_retries(monkeypatch):
+    def handler(request):
+        return httpx.Response(429, json={"code": 8, "message": "rate limit"})
+
+    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: None)
+    client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(OzonApiError, match="переждали 2 пауз"):
+        _request(client, "/v1/test", {}, max_retries=3)
 
 
 def test_get_products_merges_list_info_stocks_and_prices():

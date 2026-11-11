@@ -1,4 +1,6 @@
+import os
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -25,6 +27,53 @@ SALES_MAX_DAYS = 90
 
 # Временные сбои Ozon: лимит запросов (429) и ошибки сервера (500/502/503)
 RETRYABLE_STATUSES = {429, 500, 502, 503}
+# Сколько всего попыток: паузы между повторами растут — 2, 4, 8, 16, 32 сек
+MAX_RETRIES = 6
+# Верхняя граница паузы между повторами, сек (даже если Retry-After больше)
+MAX_RETRY_WAIT_SECONDS = 60.0
+
+DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 1.2
+
+
+def _min_request_interval_from_env() -> float:
+    """Минимальная пауза между запросами из JARVIS_OZON_MIN_REQUEST_INTERVAL.
+
+    Некорректное или отрицательное значение — берем default (1.2 сек).
+    """
+    try:
+        value = float(os.getenv("JARVIS_OZON_MIN_REQUEST_INTERVAL", ""))
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_REQUEST_INTERVAL_SECONDS
+    if value < 0:
+        return DEFAULT_MIN_REQUEST_INTERVAL_SECONDS
+    return value
+
+
+# Минимальный интервал между запросами к Ozon (одна очередь на весь процесс):
+# держимся ниже лимита «запросов в секунду», чтобы не ловить HTTP 429
+MIN_REQUEST_INTERVAL_SECONDS = _min_request_interval_from_env()
+
+_throttle_lock = threading.Lock()
+_last_request_monotonic: float | None = None
+
+
+def _throttle():
+    """Выдерживает MIN_REQUEST_INTERVAL_SECONDS между любыми запросами к Ozon.
+
+    Один общий таймер на процесс: кнопки дашборда и фоновый планировщик
+    встают в очередь, а не бьют в API одновременно.
+    """
+    global _last_request_monotonic
+    with _throttle_lock:
+        now = time.monotonic()
+        if _last_request_monotonic is not None:
+            wait_seconds = MIN_REQUEST_INTERVAL_SECONDS - (
+                now - _last_request_monotonic
+            )
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+                now = time.monotonic()
+        _last_request_monotonic = now
 
 # Склады продавца (FBS) и склады Ozon (FBO)
 WAREHOUSE_LIST_URL = "/v2/warehouse/list"
@@ -75,16 +124,35 @@ def _server_time(response: httpx.Response):
         return None
 
 
-def _request(
-    client: httpx.Client, url: str, payload: dict, max_retries: int = 5
-) -> httpx.Response:
-    """POST-запрос к Ozon с повторными попытками.
+def _retry_wait_seconds(response: httpx.Response, attempt: int) -> float:
+    """Сколько ждать перед повтором: совет сервера или экспоненциальная пауза.
 
-    Временные сбои (429, 500, 502, 503) пережидаем с экспоненциальной
-    задержкой 2, 4, 8, 16 сек и повторяем запрос. Остальные ошибки
-    (например, 401 — неверный ключ) не повторяются и падают сразу.
+    При 429 Ozon может прислать заголовок Retry-After (секунды) — слушаем его,
+    иначе пауза растет экспоненциально: 2, 4, 8, 16, 32 сек.
+    """
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            header_seconds = float(retry_after)
+        except ValueError:
+            header_seconds = 0.0
+    else:
+        header_seconds = 0.0
+    return min(MAX_RETRY_WAIT_SECONDS, max(header_seconds, float(2 ** attempt)))
+
+
+def _request(
+    client: httpx.Client, url: str, payload: dict, max_retries: int = MAX_RETRIES
+) -> httpx.Response:
+    """POST-запрос к Ozon с троттлингом и повторными попытками.
+
+    Перед каждым запросом выдерживаем MIN_REQUEST_INTERVAL_SECONDS — так не
+    попадаем в лимит Ozon «запросов в секунду». Временные сбои (429, 500,
+    502, 503) пережидаем и повторяем. Остальные ошибки (например, 401 —
+    неверный ключ) не повторяются и падают сразу.
     """
     for attempt in range(1, max_retries + 1):
+        _throttle()
         response = client.post(url, json=payload)
 
         if response.status_code == 200:
@@ -92,8 +160,12 @@ def _request(
 
         # Временный сбой, и попытки еще остались — ждем и повторяем
         if response.status_code in RETRYABLE_STATUSES and attempt < max_retries:
-            wait_seconds = 2 ** attempt
-            print(f"Лимит Ozon! Ждем {wait_seconds} сек...")
+            wait_seconds = _retry_wait_seconds(response, attempt)
+            print(
+                f"Ozon ответил HTTP {response.status_code} — ждем "
+                f"{wait_seconds:.0f} сек и повторяем "
+                f"(попытка {attempt + 1} из {max_retries})..."
+            )
             time.sleep(wait_seconds)
             continue
 
@@ -102,9 +174,13 @@ def _request(
             details = response.json()
         except ValueError:
             details = response.text[:500]
-        raise OzonApiError(
-            f"Ozon API {url} вернул HTTP {response.status_code}: {details}"
-        )
+        message = f"Ozon API {url} вернул HTTP {response.status_code}: {details}"
+        if response.status_code in RETRYABLE_STATUSES:
+            message += (
+                f" — переждали {max_retries - 1} пауз, лимит все еще превышен. "
+                "Подождите минуту и попробуйте снова"
+            )
+        raise OzonApiError(message)
 
     # Сюда попадаем, только если max_retries <= 0
     raise OzonApiError(f"Ozon API {url}: не сделано ни одной попытки (max_retries={max_retries})")

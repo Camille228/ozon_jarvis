@@ -19,7 +19,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import init_db, log_sync
 from app.ozon_client import OzonApiError
-from app.sync import sync_products, sync_sales
+from app.sync import SyncInProgressError, sync_products, sync_sales
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,13 @@ def run_sync() -> dict:
     try:
         result["products"] = sync_products()
         logger.info("Синхронизация товаров: %s", result["products"])
+    except SyncInProgressError as e:
+        # Ручная синхронизация из дашборда уже работает — это не ошибка,
+        # пишем предупреждение, чтобы не пугать красным баннером
+        message = f"Автосинхронизация товаров: {e}"
+        log_sync("OZON_API", "warning", message)
+        result["errors"].append(message)
+        logger.warning(message)
     except OzonApiError as e:
         message = f"Автосинхронизация товаров: {e}"
         log_sync("OZON_API", "error", message)
@@ -61,6 +68,11 @@ def run_sync() -> dict:
     try:
         result["sales"] = sync_sales(SALES_SYNC_DAYS)
         logger.info("Синхронизация продаж: %s строк", result["sales"])
+    except SyncInProgressError as e:
+        message = f"Автосинхронизация продаж: {e}"
+        log_sync("OZON_ANALYTICS", "warning", message)
+        result["errors"].append(message)
+        logger.warning(message)
     except OzonApiError as e:
         message = f"Автосинхронизация продаж: {e}"
         log_sync("OZON_ANALYTICS", "error", message)

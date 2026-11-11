@@ -25,7 +25,7 @@ from app.database import (
 )
 from app.economics import UnitEconomics, to_float
 from app.inventory import STALE_STOCK_DAYS
-from app.ozon_client import (
+from app.services.ozon_client import (
     OzonApiError,
     get_seller_warehouses,
     search_ozon_warehouses,

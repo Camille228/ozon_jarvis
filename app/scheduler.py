@@ -18,7 +18,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import init_db, log_sync
-from app.ozon_client import OzonApiError
+from app.services.ozon_client import OzonApiError
 from app.sync import SyncInProgressError, sync_products, sync_sales
 
 logger = logging.getLogger(__name__)

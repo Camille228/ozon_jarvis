@@ -3,7 +3,7 @@
 import threading
 
 from app.database import log_sync, save_products, save_sales
-from app.ozon_client import OzonApiError, get_products, get_sales
+from app.services.ozon_client import OzonApiError, get_products, get_sales
 
 
 class SyncInProgressError(OzonApiError):

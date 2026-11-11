@@ -1,7 +1,7 @@
 import pytest
 
 from app import scheduler
-from app.ozon_client import OzonApiError
+from app.services.ozon_client import OzonApiError
 from app.sync import SyncInProgressError
 
 

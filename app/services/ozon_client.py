@@ -7,7 +7,7 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from app.config import OZON_CLIENT_ID, OZON_API_KEY
+from app.core.config import get_settings
 
 BASE_URL = "https://api-seller.ozon.ru"
 PLACEHOLDERS = {None, "", "ваш_числовой_client_id", "ваш_api_key"}
@@ -93,7 +93,8 @@ class OzonKeysMissing(OzonApiError):
 
 
 def _check_keys():
-    if OZON_CLIENT_ID in PLACEHOLDERS or OZON_API_KEY in PLACEHOLDERS:
+    settings = get_settings()
+    if settings.ozon_client_id in PLACEHOLDERS or settings.ozon_api_key in PLACEHOLDERS:
         raise OzonKeysMissing(
             "Ключи Ozon не заданы. Заполните OZON_CLIENT_ID и OZON_API_KEY в файле .env"
         )
@@ -101,11 +102,12 @@ def _check_keys():
 
 def _build_client(transport=None) -> httpx.Client:
     _check_keys()
+    settings = get_settings()
     return httpx.Client(
         base_url=BASE_URL,
         headers={
-            "Client-Id": OZON_CLIENT_ID,
-            "Api-Key": OZON_API_KEY,
+            "Client-Id": settings.ozon_client_id,
+            "Api-Key": settings.ozon_api_key,
             "Content-Type": "application/json",
         },
         timeout=30,

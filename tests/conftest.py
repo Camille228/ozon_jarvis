@@ -1,9 +1,10 @@
 import pytest
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from app import database, ozon_client
+from app import database
 from app.core.config import get_settings
 from app.core.database import Base
+from app.services import ozon_client
 
 import app.models  # noqa: F401 — регистрируем модели в Base.metadata
 
@@ -38,15 +39,41 @@ def pg_engine():
 
 
 @pytest.fixture
-def db_session(pg_engine):
-    """Сессия в транзакции с откатом: тесты не оставляют следов в реальной БД."""
+def pg_connection(pg_engine):
+    """Соединение с открытой внешней транзакцией.
+
+    Всё, что тесты пишут через него, откатывается в конце теста —
+    реальная база не загрязняется.
+    """
     connection = pg_engine.connect()
     transaction = connection.begin()
-    session = Session(bind=connection, join_transaction_mode="create_savepoint")
+    try:
+        yield connection
+    finally:
+        transaction.rollback()
+        connection.close()
+
+
+@pytest.fixture
+def db_session(pg_connection):
+    """Сессия поверх внешней транзакции: тесты репозиториев не оставляют следов."""
+    session = Session(bind=pg_connection, join_transaction_mode="create_savepoint")
     try:
         yield session
     finally:
         session.close()
-        transaction.rollback()
-        connection.close()
 
+
+@pytest.fixture
+def session_factory(pg_connection):
+    """Фабрика сессий поверх внешней транзакции — для сервисов.
+
+    Сервисы открывают свои сессии через фабрику: commit внутри сервиса
+    фиксирует savepoint, но внешняя транзакция откатывается в teardown.
+    """
+    return sessionmaker(
+        bind=pg_connection,
+        expire_on_commit=False,
+        autoflush=False,
+        join_transaction_mode="create_savepoint",
+    )

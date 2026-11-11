@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from app.ozon_client import (
+from app.services.ozon_client import (
     BASE_URL,
     WAREHOUSE_PAGE_SIZE,
     OzonApiError,
@@ -23,7 +23,7 @@ from app.ozon_client import (
     get_seller_warehouses,
     search_ozon_warehouses,
 )
-from app import ozon_client
+from app.services import ozon_client
 
 
 @pytest.mark.parametrize(
@@ -94,7 +94,7 @@ def test_request_retries_temporary_errors(monkeypatch):
             return httpx.Response(429, json={"message": "too many requests"})
         return httpx.Response(200, json={"ok": True})
 
-    monkeypatch.setattr("app.ozon_client.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("app.services.ozon_client.time.sleep", lambda seconds: None)
     client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
 
     response = _request(client, "/v1/test", {})
@@ -130,7 +130,7 @@ def test_request_throttles_between_calls(monkeypatch):
     def handler(request):
         return httpx.Response(200, json={"ok": True})
 
-    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr("app.services.ozon_client.time.sleep", lambda s: sleeps.append(s))
     monkeypatch.setattr(ozon_client, "MIN_REQUEST_INTERVAL_SECONDS", 5.0)
     monkeypatch.setattr(ozon_client, "_last_request_monotonic", None)
     client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
@@ -149,7 +149,7 @@ def test_request_first_call_does_not_wait(monkeypatch):
     def handler(request):
         return httpx.Response(200, json={"ok": True})
 
-    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr("app.services.ozon_client.time.sleep", lambda s: sleeps.append(s))
     monkeypatch.setattr(ozon_client, "MIN_REQUEST_INTERVAL_SECONDS", 5.0)
     monkeypatch.setattr(ozon_client, "_last_request_monotonic", None)
     client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
@@ -199,7 +199,7 @@ def test_request_honors_retry_after_header(monkeypatch):
         return httpx.Response(200, json={"ok": True})
 
     sleeps = []
-    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr("app.services.ozon_client.time.sleep", lambda s: sleeps.append(s))
     client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
 
     response = _request(client, "/v1/test", {})
@@ -212,7 +212,7 @@ def test_request_rate_limit_error_explains_retries(monkeypatch):
     def handler(request):
         return httpx.Response(429, json={"code": 8, "message": "rate limit"})
 
-    monkeypatch.setattr("app.ozon_client.time.sleep", lambda s: None)
+    monkeypatch.setattr("app.services.ozon_client.time.sleep", lambda s: None)
     client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
 
     with pytest.raises(OzonApiError, match="переждали 2 пауз"):
@@ -351,7 +351,7 @@ def test_paginate_offset_walks_pages(monkeypatch):
         offsets.append(payload["offset"])
         return httpx.Response(200, json={"result": {"data": pages[payload["offset"]]}})
 
-    monkeypatch.setattr("app.ozon_client.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("app.services.ozon_client.time.sleep", lambda seconds: None)
     client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
 
     items = _paginate_offset(client, "/v1/analytics/data", {}, page_size=2)
@@ -472,7 +472,7 @@ def test_get_seller_warehouses_walks_pages(monkeypatch):
             200, json={"warehouses": [{"warehouse_id": 999, "name": "Последний"}]}
         )
 
-    monkeypatch.setattr("app.ozon_client.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("app.services.ozon_client.time.sleep", lambda seconds: None)
     client = httpx.Client(base_url=BASE_URL, transport=httpx.MockTransport(handler))
 
     warehouses = get_seller_warehouses(client=client)

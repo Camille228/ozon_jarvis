@@ -1,7 +1,7 @@
 import pytest
 
 from app import sync
-from app.ozon_client import OzonApiError
+from app.services.ozon_client import OzonApiError
 
 
 def test_sync_products_saves_and_returns_count(monkeypatch):

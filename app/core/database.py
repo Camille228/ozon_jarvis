@@ -48,9 +48,17 @@ def get_session_factory() -> sessionmaker[Session]:
 
 
 @contextmanager
-def session_scope() -> Iterator[Session]:
-    """Сессия с автокоммитом: commit при успехе, rollback при ошибке."""
-    session = get_session_factory()()
+def session_scope(
+    session_factory: sessionmaker[Session] | None = None,
+) -> Iterator[Session]:
+    """Сессия с автокоммитом: commit при успехе, rollback при ошибке.
+
+    Через опциональную session_factory вызывающий (тесты, FastAPI-
+    зависимости) подставляет свою фабрику — например, привязанную
+    к внешней транзакции.
+    """
+    factory = session_factory or get_session_factory()
+    session = factory()
     try:
         yield session
         session.commit()

@@ -1,5 +1,5 @@
 from app.database import init_db, show_products, log_sync
-from app.ozon_client import OzonApiError
+from app.services.ozon_client import OzonApiError
 from app.sync import sync_products, sync_sales
 
 if __name__ == "__main__":

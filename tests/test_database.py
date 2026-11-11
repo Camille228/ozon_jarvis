@@ -42,6 +42,7 @@ def test_init_db_creates_all_tables(db):
         "documents",
         "recommendations",
         "warehouses",
+        "tax_operations",
     } <= tables
 
 

@@ -7,6 +7,7 @@ from app.recommendations import (
     OPEN_RECOMMENDATION_STATUSES,
     RECOMMENDATION_STATUSES,
 )
+from app.tax import TAX_OPERATION_KINDS
 
 # Путь к базе можно переопределить переменной окружения — это нужно тестам,
 # чтобы они не трогали реальные данные.
@@ -149,6 +150,18 @@ def init_db():
         pause_at TEXT,
         synced_at TEXT,
         PRIMARY KEY (warehouse_id, source)
+    )
+    """)
+
+    # Операции для калькулятора АУСН: ручной ввод доходов и расходов
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tax_operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_date TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        amount REAL NOT NULL,
+        description TEXT DEFAULT '',
+        created_at TEXT
     )
     """)
 
@@ -393,6 +406,96 @@ def delete_document(doc_id: int):
     cursor.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
     conn.commit()
     conn.close()
+
+
+def _validate_tax_operation_kind(kind: str) -> str:
+    if kind not in TAX_OPERATION_KINDS:
+        raise ValueError(f"Неизвестный тип операции: {kind!r}")
+    return kind
+
+
+def add_tax_operation(operation_date: str, kind: str, amount, description: str = "") -> int:
+    """Добавляет доход или расход для расчёта АУСН. Возвращает id операции."""
+    _validate_tax_operation_kind(kind)
+
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError(f"Некорректная сумма операции: {amount!r}")
+    if value != value or value <= 0:  # NaN или неположительное
+        raise ValueError(f"Сумма операции должна быть положительной: {amount!r}")
+
+    raw_date = str(operation_date or "").strip()
+    if not raw_date:
+        raise ValueError("Укажите дату операции")
+    normalized_date = raw_date[:10]
+    try:
+        datetime.strptime(normalized_date, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(
+            f"Дата операции должна быть в формате ГГГГ-ММ-ДД: {raw_date!r}"
+        )
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO tax_operations (
+            operation_date, kind, amount, description, created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            normalized_date,
+            kind,
+            value,
+            (description or "").strip(),
+            datetime.now().isoformat(),
+        ),
+    )
+    op_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return op_id
+
+
+def delete_tax_operation(op_id: int):
+    """Удаляет операцию АУСН по id"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tax_operations WHERE id = ?", (op_id,))
+    conn.commit()
+    conn.close()
+
+
+def tax_operations(date_from: str = "", date_to: str = "") -> list[dict]:
+    """Операции для расчёта АУСН за период, новые сверху.
+
+    date_from / date_to — границы периода в формате ГГГГ-ММ-ДД, обе
+    включаются. Пустая строка — без ограничения с этой стороны.
+    """
+    query = """
+        SELECT id, operation_date, kind, amount, description, created_at
+        FROM tax_operations
+    """
+    conditions = []
+    params = []
+    if str(date_from or "").strip():
+        conditions.append("operation_date >= ?")
+        params.append(str(date_from).strip())
+    if str(date_to or "").strip():
+        conditions.append("operation_date <= ?")
+        params.append(str(date_to).strip())
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY operation_date DESC, id DESC"
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    rows = [dict(row) for row in cursor.execute(query, params).fetchall()]
+    conn.close()
+    return rows
 
 
 def _validate_recommendation_status(status: str) -> str:

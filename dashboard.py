@@ -11,11 +11,14 @@ from app.database import (
     add_document,
     add_recommendation,
     add_recommendations,
+    add_tax_operation,
     delete_document,
     delete_recommendation,
+    delete_tax_operation,
     init_db,
     log_sync,
     save_warehouses,
+    tax_operations,
     update_costs_bulk,
     update_product_economics,
     update_recommendation,
@@ -37,6 +40,13 @@ from app.recommendations import (
 from app.scheduler import create_background_scheduler, interval_hours_from_env
 from app.stock_analysis import build_stock_table
 from app.sync import sync_products, sync_sales
+from app.tax import (
+    OBJECT_INCOME_EXPENSE,
+    OBJECT_LABELS,
+    TAX_OPERATION_KIND_LABELS,
+    ausn_limit_warning,
+    compare_ausn,
+)
 from app.warehouses import (
     seller_status_label,
     warehouse_map_url,
@@ -114,6 +124,16 @@ def load_warehouses() -> pd.DataFrame:
     except sqlite3.Error as e:
         st.error(f"Не удалось прочитать справочник складов: {e}")
         return pd.DataFrame()
+
+
+def load_tax_operations(date_from: str = "", date_to: str = "") -> pd.DataFrame:
+    """Читает операции (доходы/расходы) для расчёта АУСН за период."""
+    try:
+        rows = tax_operations(date_from, date_to)
+    except sqlite3.Error as e:
+        st.error(f"Не удалось прочитать операции для расчёта налога: {e}")
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
 def cell_text(value) -> str:
@@ -1030,6 +1050,152 @@ with st.form("document_form", clear_on_submit=True):
                 doc_notes.strip(),
             )
             st.success("Документ добавлен.")
+            st.rerun()
+
+# --- АУСН: КАЛЬКУЛЯТОР НАЛОГА ---
+st.subheader("АУСН: калькулятор налога")
+st.caption(
+    "Доходы и расходы вводятся вручную — для сверки с налогом, который посчитает "
+    "ФНС по банковским выпискам. На АУСН не платятся страховые взносы, поэтому "
+    "в расходах они не учитываются. Расчёт здесь предварительный."
+)
+
+tax_today = datetime.now().date()
+tax_period = st.date_input(
+    "Период расчёта",
+    (tax_today.replace(month=1, day=1), tax_today),
+    key="tax_period",
+)
+if isinstance(tax_period, (list, tuple)):
+    if len(tax_period) == 2:
+        tax_from, tax_to = tax_period
+    else:
+        tax_from = tax_to = tax_period[0]
+else:
+    tax_from = tax_to = tax_period
+
+df_tax_ops = load_tax_operations(tax_from.isoformat(), tax_to.isoformat())
+
+if df_tax_ops.empty:
+    income_total = 0.0
+    expense_total = 0.0
+    st.info("Операций за период нет — добавьте первую ниже.")
+else:
+    income_total = df_tax_ops.loc[df_tax_ops["kind"] == "income", "amount"].sum()
+    expense_total = df_tax_ops.loc[df_tax_ops["kind"] == "expense", "amount"].sum()
+
+    ops_display = df_tax_ops.copy()
+    ops_display["kind_label"] = ops_display["kind"].map(TAX_OPERATION_KIND_LABELS)
+    st.dataframe(
+        ops_display[["operation_date", "kind_label", "amount", "description"]].rename(
+            columns={
+                "operation_date": "Дата",
+                "kind_label": "Тип",
+                "amount": "Сумма, руб.",
+                "description": "Описание",
+            }
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    with st.expander("Удалить операцию"):
+        tax_op_id = st.selectbox(
+            "Операция",
+            df_tax_ops["id"].tolist(),
+            format_func=lambda i: (
+                f"#{i} — "
+                f"{df_tax_ops.loc[df_tax_ops['id'] == i, 'operation_date'].iloc[0]} · "
+                f"{TAX_OPERATION_KIND_LABELS.get(df_tax_ops.loc[df_tax_ops['id'] == i, 'kind'].iloc[0], '')} · "
+                f"{df_tax_ops.loc[df_tax_ops['id'] == i, 'amount']:,.2f} руб."
+            ),
+            key="delete_tax_op_id",
+        )
+        if st.button("🗑 Удалить", key="delete_tax_op_btn"):
+            delete_tax_operation(int(tax_op_id))
+            st.rerun()
+
+# Подсказка для сверки: заказы в Ozon за выбранный период
+df_tax_sales = load_sales()
+if not df_tax_sales.empty:
+    tax_sales = df_tax_sales.copy()
+    tax_sales["day_dt"] = pd.to_datetime(tax_sales["day"], errors="coerce")
+    in_period = tax_sales[
+        tax_sales["day_dt"].between(pd.Timestamp(tax_from), pd.Timestamp(tax_to))
+    ]
+    ordered_hint = in_period["revenue"].sum()
+    if ordered_hint:
+        st.caption(
+            f"🧾 Для сверки: заказы в Ozon за период — {ordered_hint:,.2f} руб. "
+            "Это заказы, а не поступления денег: на АУСН доход — деньги, "
+            "поступившие на счёт."
+        )
+
+limit_warning = ausn_limit_warning(income_total)
+if limit_warning:
+    st.error(f"⚠️ {limit_warning}")
+
+tax_results = compare_ausn(income_total, expense_total)
+col_income_tax, col_mixed_tax = st.columns(2)
+for tax_result, tax_column in zip(tax_results, (col_income_tax, col_mixed_tax)):
+    tax_column.metric(
+        OBJECT_LABELS[tax_result.object_type],
+        f"{tax_result.tax_to_pay:,.2f} руб.",
+    )
+
+if income_total > 0:
+    best_tax = min(tax_results, key=lambda r: r.tax_to_pay)
+    tax_saving = abs(tax_results[0].tax_to_pay - tax_results[1].tax_to_pay)
+    st.caption(
+        f"💰 Выгоднее объект «{OBJECT_LABELS[best_tax.object_type]}»: "
+        f"заплатите примерно {best_tax.tax_to_pay:,.2f} руб."
+        + (f" (экономия {tax_saving:,.2f} руб.)" if tax_saving > 0 else "")
+    )
+
+with st.expander("Как считаем (детали)"):
+    for tax_result in tax_results:
+        st.markdown(f"**{OBJECT_LABELS[tax_result.object_type]}**")
+        st.write(
+            f"Налоговая база: {tax_result.base:,.2f} руб. × "
+            f"{tax_result.rate:.0%} = {tax_result.tax:,.2f} руб."
+        )
+        if tax_result.object_type == OBJECT_INCOME_EXPENSE:
+            st.write(
+                f"Минимальный налог (3% от доходов): {tax_result.min_tax:,.2f} руб."
+            )
+        st.write(
+            f"Эффективная ставка: {tax_result.effective_rate:.2f}% · "
+            f"К уплате: **{tax_result.tax_to_pay:,.2f} руб.**"
+        )
+
+with st.form("tax_operation_form", clear_on_submit=True):
+    st.markdown("**Добавить операцию**")
+    tax_op_date = st.date_input("Дата операции", tax_today, key="tax_op_date")
+    tax_op_kind = st.selectbox(
+        "Тип операции",
+        list(TAX_OPERATION_KIND_LABELS),
+        format_func=lambda k: TAX_OPERATION_KIND_LABELS[k],
+        key="tax_op_kind",
+    )
+    tax_op_amount = st.number_input(
+        "Сумма, руб.", min_value=0.01, step=0.01, format="%.2f", key="tax_op_amount"
+    )
+    tax_op_description = st.text_input(
+        "Описание (необязательно)", key="tax_op_description"
+    )
+    tax_op_submitted = st.form_submit_button("💾 Добавить операцию")
+    if tax_op_submitted:
+        try:
+            add_tax_operation(
+                tax_op_date.isoformat(),
+                tax_op_kind,
+                tax_op_amount,
+                tax_op_description,
+            )
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            st.success("Операция добавлена.")
             st.rerun()
 
 # --- ЖУРНАЛ СИНХРОНИЗАЦИИ ---
